@@ -46,7 +46,7 @@ def process_monthly(date_range: str, folder_path: str, freq: str='1m', market_ty
     assert data_type in ['klines', 'trades']
 
     tokens_dir = os.path.join(folder_path, "data", market_type, "monthly", data_type)
-    list_tokens = os.listdir(tokens_dir)
+    list_tokens = sorted(os.listdir(tokens_dir))
 
     sql_connection = create_connection(f"binance_{market_type}_{data_type}_{freq}")
 
