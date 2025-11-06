@@ -1,39 +1,8 @@
-def process_time(epoch_str):
-    epoch = int(epoch_str)
-    digits = len(str(epoch))
-    if digits == 13:
-        epoch *= 1e3
-    elif digits == 16:
-        pass
-    else:
-        raise Exception(f'Unexpected epoch digits: {digits}')
-    return epoch
+import sys
+sys.path.append('../')
 
-def parse_file(file_path):
-    klines = []
-    with open(file_path, 'r') as f:
-        for line in f:
-            parts = line.strip().split(',')
-            if len(parts) < 12:
-                continue  # Skip lines that don't have enough data
+from my_src.file_utils import parse_file
 
-            open_time, close_time = process_time(parts[0]), process_time(parts[6])
-
-            kline = {
-                'open_time': open_time,
-                'open': float(parts[1]),
-                'high': float(parts[2]),
-                'low': float(parts[3]),
-                'close': float(parts[4]),
-                'volume': float(parts[5]),
-                'close_time': close_time,
-                'quote_volume': float(parts[7]),
-                'count': int(parts[8]),
-                'taker_buy_base_volume': float(parts[9]),
-                'taker_buy_quote_volume': float(parts[10])
-            }
-            klines.append(kline)
-    return klines
 
 def process_file(file_path, pair_name, sql_connection):
     klines = parse_file(file_path)

@@ -1,44 +1,11 @@
 import os
-import hashlib
-import zipfile
 from tqdm import tqdm
 import sys
-
 sys.path.append('../')
 
+from my_src.file_utils import verify_checksum, unzip_file
 from my_src.sql_connection import create_connection
 from my_src.process_kline_file import process_file
-
-
-def verify_checksum(zip_file_path, checksum_file_path):
-    """
-    Compare SHA256 checksum of zip file with value in checksum file.
-    """
-    with open(checksum_file_path, 'r') as f:
-        expected_checksum = f.read().strip().split('  ')[0]
-    sha256 = hashlib.sha256()
-    with open(zip_file_path, 'rb') as f:
-        for chunk in iter(lambda: f.read(8192), b''):
-            sha256.update(chunk)
-    actual_checksum = sha256.hexdigest()
-    if actual_checksum != expected_checksum:
-        raise Exception(f"Checksum mismatch for {zip_file_path}: expected {expected_checksum}, got {actual_checksum}")
-    return True
-
-
-def unzip_file(zip_file_path, extract_dir):
-    """
-    Unzip zip_file_path into extract_dir. Returns path to extracted CSV file.
-    Assumes the CSV file inside has the same base name as the zip file.
-    """
-    with zipfile.ZipFile(zip_file_path, 'r') as zip_ref:
-        zip_ref.extractall(extract_dir)
-        # Find the CSV file with the same base name
-        base_name = os.path.splitext(os.path.basename(zip_file_path))[0]
-        csv_file_path = os.path.join(extract_dir, f"{base_name}.csv")
-        if not os.path.exists(csv_file_path):
-            raise Exception(f"CSV file {csv_file_path} not found after extracting {zip_file_path}")
-        return csv_file_path
 
 
 def process_monthly(date_range: str, folder_path: str, freq: str='1m', market_type: str='spot', data_type: str='klines'):
