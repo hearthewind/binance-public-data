@@ -1,3 +1,14 @@
+def process_time(epoch_str):
+    epoch = int(epoch_str)
+    digits = len(str(epoch))
+    if digits == 13:
+        epoch *= 1e3
+    elif digits == 16:
+        pass
+    else:
+        raise Exception(f'Unexpected epoch digits: {digits}')
+    return epoch
+
 def parse_file(file_path):
     klines = []
     with open(file_path, 'r') as f:
@@ -5,14 +16,17 @@ def parse_file(file_path):
             parts = line.strip().split(',')
             if len(parts) < 12:
                 continue  # Skip lines that don't have enough data
+
+            open_time, close_time = process_time(parts[0]), process_time(parts[6])
+
             kline = {
-                'open_time': int(parts[0]),
+                'open_time': open_time,
                 'open': float(parts[1]),
                 'high': float(parts[2]),
                 'low': float(parts[3]),
                 'close': float(parts[4]),
                 'volume': float(parts[5]),
-                'close_time': int(parts[6]),
+                'close_time': close_time,
                 'quote_volume': float(parts[7]),
                 'count': int(parts[8]),
                 'taker_buy_base_volume': float(parts[9]),
