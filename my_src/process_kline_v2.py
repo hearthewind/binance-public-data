@@ -1,45 +1,78 @@
 import os
 from tqdm import tqdm
 import sys
-from datetime import datetime, timezone, date, timedelta
+from datetime import datetime, timezone, date
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 
 sys.path.append('../')
 
-from my_src.file_utils import parse_file, verify_checksum, unzip_file
+from my_src.file_utils import verify_checksum, unzip_file, process_time
 from my_src.sql_connection import create_connection
 
 
 DB_NAME = 'binance_marketdata'
 
 
-def days_range(start_date: date, end_date: date):
-    """Yield list of date objects from start_date to end_date inclusive."""
-    days = []
-    cur = start_date
-    while cur <= end_date:
-        days.append(cur)
-        cur = cur + timedelta(days=1)
-    return days
+def first_of_month(d: date) -> date:
+    return date(d.year, d.month, 1)
 
 
-def ensure_table_exists_and_base_partition(conn, table_name: str):
+def next_month(d: date) -> date:
+    if d.month == 12:
+        return date(d.year + 1, 1, 1)
+    return date(d.year, d.month + 1, 1)
+
+
+def months_range(start_date: date, end_date: date):
+    start_m = first_of_month(start_date)
+    end_m = first_of_month(end_date)
+    cur = start_m
+    while cur <= end_m:
+        yield cur
+        cur = next_month(cur)
+
+
+def date_to_epoch_us(d: date) -> int:
+    """Start-of-day UTC epoch in microseconds for the given date."""
+    return int(datetime(d.year, d.month, d.day, tzinfo=timezone.utc).timestamp() * 1_000_000)
+
+
+def parse_date_range_str(s: str) -> tuple[date, date]:
+    """Parse 'YYYY-MM-DD_YYYY-MM-DD' into (start_date, end_date)."""
+    s_date, e_date = s.split('_')
+    sd = datetime.strptime(s_date, '%Y-%m-%d').date()
+    ed = datetime.strptime(e_date, '%Y-%m-%d').date()
+    if ed < sd:
+        raise ValueError('end_date earlier than start_date')
+    return sd, ed
+
+
+def ensure_table_created_with_partitions(conn, table_name: str, start_day: date, end_day: date, subparts: int = 16):
+    """Create schema and the unified table once, partitioned by open_time per MONTH, with HASH subpartitions by symbol.
+
+    This keeps partition count small and spreads concurrent inserts across subpartitions, while keeping
+    time-range pruning efficient. The primary key is (open_time, symbol) for fast time-range access.
+    """
     cur = conn.cursor()
     # Create database if not exists
     cur.execute(f"CREATE DATABASE IF NOT EXISTS `{DB_NAME}` DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;")
     cur.execute(f"USE `{DB_NAME}`;")
-    # Ensure the session operates in UTC so FROM_UNIXTIME(...) yields UTC datetime
-    try:
-        cur.execute("SET time_zone = '+00:00';")
-    except Exception:
-        # If the server doesn't allow setting time_zone, proceed but note behavior may vary
-        pass
 
-    # Create the single unified table with a generated year_month column and a MAXVALUE partition placeholder.
-    # open_time is stored in microseconds (16-digit epoch). open_date is derived from open_time/1e6 as DATE.
+    # Build monthly partitions from start_day to end_day (inclusive of months spanned)
+    parts = []
+    for m in months_range(start_day, end_day):
+        upper = date_to_epoch_us(next_month(m))
+        pname = f"p{m.strftime('%Y%m')}"
+        parts.append(f"PARTITION `{pname}` VALUES LESS THAN ({upper})")
+    parts.append("PARTITION pmax VALUES LESS THAN (MAXVALUE)")
+    parts_sql = ",\n      ".join(parts)
+
+    # Create table partitioned by open_time (integer), subpartitioned by symbol
     cur.execute(f"""
     CREATE TABLE IF NOT EXISTS `{table_name}` (
-      `symbol` VARCHAR(64) NOT NULL,
       `open_time` BIGINT UNSIGNED NOT NULL,
+      `symbol` VARCHAR(64) NOT NULL,
       `open` DOUBLE NOT NULL,
       `high` DOUBLE NOT NULL,
       `low` DOUBLE NOT NULL,
@@ -50,183 +83,135 @@ def ensure_table_exists_and_base_partition(conn, table_name: str):
       `count` INT NOT NULL,
       `taker_buy_base_volume` DOUBLE NOT NULL,
       `taker_buy_quote_volume` DOUBLE NOT NULL,
-      `open_date` DATE AS (DATE(FROM_UNIXTIME(open_time/1000000))) STORED,
-      -- Include partitioning column `open_date` in the PRIMARY KEY to satisfy MySQL partitioning rules
-      PRIMARY KEY (`symbol`, `open_date`, `open_time`),
-      KEY `idx_open_time` (`open_time`)
+      PRIMARY KEY (`open_time`, `symbol`)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-    PARTITION BY RANGE COLUMNS(open_date) (
-      PARTITION pmax VALUES LESS THAN (MAXVALUE)
+    PARTITION BY RANGE (`open_time`)
+    SUBPARTITION BY KEY (`symbol`)
+    SUBPARTITIONS {subparts}
+    (
+      {parts_sql}
     );
     """)
     conn.commit()
     cur.close()
 
 
-def get_existing_partitions(conn, table_name: str):
+def check_local_infile_enabled(conn):
     cur = conn.cursor()
-    cur.execute(f"SELECT PARTITION_NAME, PARTITION_DESCRIPTION FROM INFORMATION_SCHEMA.PARTITIONS WHERE TABLE_SCHEMA=%s AND TABLE_NAME=%s AND PARTITION_NAME IS NOT NULL;", (DB_NAME, table_name))
-    rows = cur.fetchall()
+    cur.execute("SHOW VARIABLES LIKE 'local_infile';")
+    row = cur.fetchone()
     cur.close()
-    # build set of less-than values where applicable
-    existing = set()
-    for pname, pdesc in rows:
-        # pdesc may be a string or numeric representation, or None for MAXVALUE
-        if pdesc is None:
-            existing.add('MAXVALUE')
-            continue
-        s = str(pdesc).strip()
-        if s.upper() == 'MAXVALUE':
-            existing.add('MAXVALUE')
-            continue
-        s = s.strip("'\"")
-        # try to parse into a date and normalize to ISO 'YYYY-MM-DD'
-        parsed = None
-        for fmt in ("%Y-%m-%d", "%Y%m%d", "%Y-%m-%d %H:%M:%S", "%Y%m%d%H%M%S"):
-            try:
-                parsed = datetime.strptime(s, fmt).date()
-                break
-            except Exception:
-                continue
-        if parsed:
-            existing.add(parsed.isoformat())
-        else:
-            # fallback to raw string
-            existing.add(s)
-    return existing
+    if not row:
+        return False
+    name, val = row
+    return str(val).lower() in ('on', '1', 'true', 'yes')
 
 
-def get_latest_partition_date(conn, table_name: str):
-    """Return the maximum partition DESCRIPTION as a date object, or None if none (excluding MAXVALUE)."""
-    cur = conn.cursor()
-    cur.execute("SELECT PARTITION_DESCRIPTION FROM INFORMATION_SCHEMA.PARTITIONS WHERE TABLE_SCHEMA=%s AND TABLE_NAME=%s AND PARTITION_DESCRIPTION IS NOT NULL;", (DB_NAME, table_name))
-    rows = cur.fetchall()
-    cur.close()
-    max_date = None
-    for (pdesc,) in rows:
-        if pdesc is None:
-            continue
-        s = str(pdesc).strip()
-        if s.upper() == 'MAXVALUE':
-            continue
-        s = s.strip("'\"")
-        parsed = None
-        for fmt in ("%Y-%m-%d", "%Y%m%d", "%Y-%m-%d %H:%M:%S", "%Y%m%d%H%M%S"):
-            try:
-                parsed = datetime.strptime(s, fmt).date()
-                break
-            except Exception:
-                continue
-        if parsed:
-            if (max_date is None) or (parsed > max_date):
-                max_date = parsed
-    return max_date
-
-
-def add_day_partitions(conn, table_name: str, days):
-    """Ensure that each date in days (date objects) has a partition. Adds partitions by reorganizing the pmax partition.
-
-    For each day D we create a partition with VALUES LESS THAN ('D_plus_1') where D_plus_1 is next day's date.
+def tune_session_for_bulk_load(cur):
+    """Apply session-level settings that significantly speed up bulk loads.
+    Requires non-replicated environment. Adjust if using replication.
     """
-    if not days:
-        return
-    # normalize and sort unique
-    days = sorted({d for d in days})
+    stmts = [
+        "SET time_zone = '+00:00'",
+        "SET SESSION unique_checks = 0",
+        "SET SESSION foreign_key_checks = 0",
+        "SET SESSION sql_log_bin = 0",
+        "SET SESSION innodb_flush_log_at_trx_commit = 2",
+        "SET SESSION sync_binlog = 0",
+    ]
+    for s in stmts:
+        try:
+            cur.execute(s)
+        except Exception:
+            # Ignore if not permitted
+            pass
+
+
+def load_csv_into_mysql(csv_file_path: str, token: str, conn, table_name: str) -> int:
+    """Fast bulk load a Binance kline CSV into MySQL using LOAD DATA LOCAL INFILE.
+
+    Returns the number of rows reported inserted by the server (best-effort).
+    """
+    # Build SQL with literal filename and token, as some connectors don't support parameters for LOAD DATA
+    def esc(s: str) -> str:
+        return s.replace('\\', r'\\').replace("'", r"\'")
+
+    file_lit = esc(csv_file_path)
+    token_lit = esc(token)
+    load_sql = f"""
+        LOAD DATA LOCAL INFILE '{file_lit}' IGNORE INTO TABLE `{table_name}`
+        FIELDS TERMINATED BY ','
+        LINES TERMINATED BY '\n'
+        (@ot, @o, @h, @l, @c, @v, @ct, @qv, @cnt, @tbv, @tbqv, @ign)
+        SET
+          `symbol` = '{token_lit}',
+          `open_time` = CASE
+              WHEN CHAR_LENGTH(@ot) = 13 THEN CAST(@ot AS UNSIGNED) * 1000
+              WHEN CHAR_LENGTH(@ot) = 16 THEN CAST(@ot AS UNSIGNED)
+              ELSE NULL
+          END,
+          `open` = @o,
+          `high` = @h,
+          `low` = @l,
+          `close` = @c,
+          `volume` = @v,
+          `close_time` = CASE
+              WHEN CHAR_LENGTH(@ct) = 13 THEN CAST(@ct AS UNSIGNED) * 1000
+              WHEN CHAR_LENGTH(@ct) = 16 THEN CAST(@ct AS UNSIGNED)
+              ELSE NULL
+          END,
+          `quote_volume` = @qv,
+          `count` = @cnt,
+          `taker_buy_base_volume` = @tbv,
+          `taker_buy_quote_volume` = @tbqv;
+    """
     cur = conn.cursor()
-
-    existing = get_existing_partitions(conn, table_name)
-    latest = get_latest_partition_date(conn, table_name)
-    # only add days strictly after the latest existing partition's less-than value
-    if latest is not None:
-        eligible_days = [d for d in days if d > latest]
-    else:
-        eligible_days = days
-
-    # filter out any days already present
-    partitions_to_add = [d for d in eligible_days if d.isoformat() not in existing]
-    if not partitions_to_add:
-        cur.close()
-        return
-
-    # Build a single REORGANIZE statement that adds all new partitions in ascending order
-    # Ensure the first partition we add is strictly after existing max partition
-    existing_max = get_latest_partition_date(conn, table_name)
-    # drop days that are <= existing_max (safety)
-    if existing_max is not None:
-        while partitions_to_add and partitions_to_add[0] <= existing_max:
-            partitions_to_add.pop(0)
-    if not partitions_to_add:
-        cur.close()
-        return
-
-    parts_sql = []
-    for d in partitions_to_add:
-        next_day = d + timedelta(days=1)
-        less_than_str = next_day.isoformat()
-        part_name = f"p{d.strftime('%Y%m%d')}"
-        parts_sql.append(f"PARTITION `{part_name}` VALUES LESS THAN ('{less_than_str}')")
-
-    # Append the pmax partition at the end
-    parts_sql.append("PARTITION pmax VALUES LESS THAN (MAXVALUE)")
-    alter_sql = f"ALTER TABLE `{table_name}` REORGANIZE PARTITION pmax INTO ({', '.join(parts_sql)});"
-    cur.execute(f"USE `{DB_NAME}`;")
-    cur.execute(alter_sql)
+    cur.execute(load_sql)
+    affected = cur.rowcount if hasattr(cur, 'rowcount') else -1
     conn.commit()
-    # update existing set
-    for d in partitions_to_add:
-        existing.add(d.isoformat())
     cur.close()
+    return affected
 
 
-def process_file(file_path, pair_name, sql_connection, table_name: str):
-    klines = parse_file(file_path)
-    if not klines:
-        return
-
-    # normalize and compute month coverage
-    rows = []
-    days = []
-    for kline in klines:
-        # Ensure epoch values are ints (microseconds). parse_file/process_time in file_utils may return floats.
-        open_time = int(kline['open_time'])
-        close_time = int(kline['close_time'])
-        rows.append((
-            pair_name,
-            open_time,
-            float(kline['open']),
-            float(kline['high']),
-            float(kline['low']),
-            float(kline['close']),
-            float(kline['volume']),
-            close_time,
-            float(kline['quote_volume']),
-            int(kline['count']),
-            float(kline['taker_buy_base_volume']),
-            float(kline['taker_buy_quote_volume'])
-        ))
-        # compute the UTC date (day) for partitioning
-        dt = datetime.fromtimestamp(open_time / 1_000_000, timezone.utc)
-        days.append(dt.date())
-
-    # Ensure table exists and base partition
-    ensure_table_exists_and_base_partition(sql_connection, table_name)
-
-    # Add needed partitions for months in this file
-    min_day = min(days)
-    max_day = max(days)
-    needed = days_range(min_day, max_day)
-    add_day_partitions(sql_connection, table_name, needed)
-
-    # Bulk insert
-    cur = sql_connection.cursor()
-    insert_query = f"""
-        INSERT IGNORE INTO `{table_name}` (
-          symbol, open_time, open, high, low, close, volume, close_time, quote_volume, `count`, taker_buy_base_volume, taker_buy_quote_volume
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
+def load_csv_via_insert(csv_file_path: str, token: str, conn, table_name: str, batch_size: int = 5000) -> int:
+    """Fallback loader: stream the CSV in Python and issue batched INSERT IGNORE statements.
+    Returns total rows attempted (best-effort; IGNORE may drop duplicates).
     """
-    cur.executemany(insert_query, rows)
-    sql_connection.commit()
+    total = 0
+    rows = []
+    cur = conn.cursor()
+    sql = f"""
+        INSERT IGNORE INTO `{table_name}`
+        (`open_time`, `symbol`, `open`, `high`, `low`, `close`, `volume`, `close_time`, `quote_volume`, `count`, `taker_buy_base_volume`, `taker_buy_quote_volume`)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+    """
+    with open(csv_file_path, 'r') as f:
+        for line in f:
+            parts = line.rstrip('\n').split(',')
+            if len(parts) < 12:
+                continue
+            ot = process_time(parts[0])
+            ct = process_time(parts[6])
+            if ot is None or ct is None:
+                continue
+            try:
+                o = float(parts[1]); h = float(parts[2]); l = float(parts[3]); c = float(parts[4])
+                v = float(parts[5]); qv = float(parts[7]); cnt = int(parts[8])
+                tbv = float(parts[9]); tbqv = float(parts[10])
+            except Exception:
+                continue
+            rows.append((ot, token, o, h, l, c, v, ct, qv, cnt, tbv, tbqv))
+            if len(rows) >= batch_size:
+                cur.executemany(sql, rows)
+                conn.commit()
+                total += len(rows)
+                rows.clear()
+    if rows:
+        cur.executemany(sql, rows)
+        conn.commit()
+        total += len(rows)
     cur.close()
+    return total
 
 
 def process_monthly(date_range: str, folder_path: str, freq: str='1m', market_type: str='spot', data_type: str='klines'):
@@ -236,31 +221,119 @@ def process_monthly(date_range: str, folder_path: str, freq: str='1m', market_ty
     tokens_dir = os.path.join(folder_path, "data", market_type, "monthly", data_type)
     list_tokens = sorted(os.listdir(tokens_dir))
 
-    sql_connection = create_connection(DB_NAME)
     # derive table name from freq (e.g., '1m' -> 'klines_1m')
     table_name = f"klines_{freq}"
 
-    for token in tqdm(list_tokens, desc="Processing tokens"):
-        zip_folder = os.path.join(tokens_dir, token, freq, date_range)
-        all_files = os.listdir(zip_folder)
-        all_file_names = set([f.split(".")[0] for f in all_files])
-        for file_name in all_file_names:
-            zip_file_path = os.path.join(zip_folder, f"{file_name}.zip")
-            checksum_file_path = os.path.join(zip_folder, f"{file_name}.zip.CHECKSUM")
-            # Step 1: Verify checksum (raises on mismatch)
-            verify_checksum(zip_file_path, checksum_file_path)
-            # Step 2: Unzip file
-            csv_file_path = unzip_file(zip_file_path, zip_folder)
-            try:
-                # Step 3: Process CSV file into MySQL
-                process_file(csv_file_path, token, sql_connection, table_name)
-            finally:
-                # Step 4: Remove CSV file after processing (keep zip and checksum intact)
-                if os.path.exists(csv_file_path):
-                    os.remove(csv_file_path)
+    # Parse the overall date range once and precreate all needed partitions
+    start_day, end_day = parse_date_range_str(date_range)
+    sql_connection = create_connection(DB_NAME)
 
-    print('Finished, closing sql connection')
+    # Diagnose LOCAL INFILE capability early, allow override via env to force fallback path
+    force_insert = os.environ.get('KLINE_LOAD_FORCE_INSERT', '0') in ('1', 'true', 'True')
+    use_local = check_local_infile_enabled(sql_connection) and not force_insert
+    if not use_local:
+        msg = "Using fallback batched INSERT loader (local_infile is OFF or forced). This is slower than LOAD DATA."
+        print(msg)
+    else:
+        print("Using LOAD DATA LOCAL INFILE fast path.")
+
+    ensure_table_created_with_partitions(sql_connection, table_name, start_day, end_day)
     sql_connection.close()
+
+    # Discover work
+    work = {}
+    total_files = 0
+    for token in list_tokens:
+        zip_folder = os.path.join(tokens_dir, token, freq, date_range)
+        if not os.path.isdir(zip_folder):
+            continue
+        all_files = os.listdir(zip_folder)
+        base_names = sorted({f.split('.')[0] for f in all_files})
+        pairs = []
+        for base in base_names:
+            zip_file_path = os.path.join(zip_folder, f"{base}.zip")
+            checksum_file_path = os.path.join(zip_folder, f"{base}.zip.CHECKSUM")
+            if os.path.exists(zip_file_path) and os.path.exists(checksum_file_path):
+                pairs.append((zip_file_path, checksum_file_path, zip_folder))
+        if pairs:
+            work[token] = pairs
+            total_files += len(pairs)
+
+    if total_files == 0:
+        print(f"No files found under {tokens_dir}/<TOKEN>/{freq}/{date_range}. Nothing to load.")
+        return
+
+    print(f"Discovered {len(work)} tokens and {total_files} files to load into {DB_NAME}.{table_name}.")
+
+    # Progress bars (thread-safe updates)
+    file_pbar = tqdm(total=total_files, desc="Files", position=0, leave=True)
+    token_pbar = tqdm(total=len(work), desc="Tokens", position=1, leave=True)
+    pbar_lock = threading.Lock()
+
+    env_workers = os.environ.get('KLINE_LOAD_WORKERS')
+    if env_workers:
+        try:
+            max_workers = max(1, int(env_workers))
+        except Exception:
+            max_workers = min(max(8, (os.cpu_count() or 4) // 2), 24)
+    else:
+        max_workers = min(24, max(8, (os.cpu_count() or 4)))
+
+    def worker(token: str, pairs: list[tuple[str, str, str]]):
+        conn = create_connection(DB_NAME)
+        cur = conn.cursor()
+        tune_session_for_bulk_load(cur)
+        try:
+            for (zip_file_path, checksum_file_path, zip_folder) in pairs:
+                verify_checksum(zip_file_path, checksum_file_path)
+                csv_file_path = unzip_file(zip_file_path, zip_folder)
+                try:
+                    if use_local:
+                        inserted = load_csv_into_mysql(csv_file_path, token, conn, table_name)
+                    else:
+                        inserted = load_csv_via_insert(csv_file_path, token, conn, table_name)
+                    if inserted == 0:
+                        try:
+                            wcur = conn.cursor()
+                            wcur.execute("SHOW WARNINGS LIMIT 5;")
+                            warns = wcur.fetchall()
+                            wcur.close()
+                            if warns:
+                                print(f"WARNINGS for {token} {os.path.basename(csv_file_path)}: {warns}")
+                        except Exception:
+                            pass
+                finally:
+                    if os.path.exists(csv_file_path):
+                        try:
+                            os.remove(csv_file_path)
+                        except Exception:
+                            pass
+                with pbar_lock:
+                    file_pbar.update(1)
+        finally:
+            cur.close()
+            conn.close()
+            with pbar_lock:
+                token_pbar.update(1)
+        return token
+
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = [ex.submit(worker, tok, pairs) for tok, pairs in work.items()]
+        # Wait for all
+        for _ in as_completed(futures):
+            pass
+
+    file_pbar.close()
+    token_pbar.close()
+
+    # Final verification count
+    verify_conn = create_connection(DB_NAME)
+    vcur = verify_conn.cursor()
+    vcur.execute(f"SELECT COUNT(*) FROM `{table_name}`;")
+    total_rows = vcur.fetchone()[0]
+    vcur.close()
+    verify_conn.close()
+    print(f'Finished all loads. Table {DB_NAME}.{table_name} now has {total_rows} rows.')
 
 
 if __name__ == '__main__':
