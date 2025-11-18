@@ -40,7 +40,7 @@ def process_time(epoch_str):
     epoch = int(epoch_str)
     digits = len(str(epoch))
     if digits == 13:
-        epoch *= 1e3
+        epoch *= 1000
     elif digits == 16:
         pass
     else:

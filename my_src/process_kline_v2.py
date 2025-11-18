@@ -49,51 +49,112 @@ def parse_date_range_str(s: str) -> tuple[date, date]:
 
 
 def ensure_table_created_with_partitions(conn, table_name: str, start_day: date, end_day: date, subparts: int = 16):
-    """Create schema and the unified table once, partitioned by open_time per MONTH, with HASH subpartitions by symbol.
+    """Create schema artifacts and ensure the table has monthly partitions with hashed subpartitions.
 
-    This keeps partition count small and spreads concurrent inserts across subpartitions, while keeping
-    time-range pruning efficient. The primary key is (open_time, symbol) for fast time-range access.
-    """
+    Every token shares one table; we keep the VARCHAR symbol next to the timestamps so downstream
+    queries stay simple. Monthly range partitions keep the partition count manageable while
+    still allowing efficient open_time pruning, and hash subpartitions spread concurrent inserts."""
+
+    def ensure_database(cur):
+        cur.execute(f"CREATE DATABASE IF NOT EXISTS `{DB_NAME}` DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;")
+        cur.execute(f"USE `{DB_NAME}`;")
+
+    def ensure_klines_table(cur):
+        cur.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS `{table_name}` (
+              `open_time` BIGINT UNSIGNED NOT NULL,
+              `symbol` VARCHAR(64) NOT NULL,
+              `open` DOUBLE NOT NULL,
+              `high` DOUBLE NOT NULL,
+              `low` DOUBLE NOT NULL,
+              `close` DOUBLE NOT NULL,
+              `volume` DOUBLE NOT NULL,
+              `close_time` BIGINT UNSIGNED NOT NULL,
+              `quote_volume` DOUBLE NOT NULL,
+              `count` INT NOT NULL,
+              `taker_buy_base_volume` DOUBLE NOT NULL,
+              `taker_buy_quote_volume` DOUBLE NOT NULL,
+              PRIMARY KEY (`open_time`, `symbol`),
+              KEY `idx_symbol_time` (`symbol`, `open_time`)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            PARTITION BY RANGE (`open_time`)
+            SUBPARTITION BY KEY (`symbol`)
+            SUBPARTITIONS {subparts}
+            (
+              PARTITION `p00000000` VALUES LESS THAN (0),
+              PARTITION `pmax` VALUES LESS THAN (MAXVALUE)
+            );
+            """
+        )
+
     cur = conn.cursor()
-    # Create database if not exists
-    cur.execute(f"CREATE DATABASE IF NOT EXISTS `{DB_NAME}` DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;")
-    cur.execute(f"USE `{DB_NAME}`;")
-
-    # Build monthly partitions from start_day to end_day (inclusive of months spanned)
-    parts = []
-    for m in months_range(start_day, end_day):
-        upper = date_to_epoch_us(next_month(m))
-        pname = f"p{m.strftime('%Y%m')}"
-        parts.append(f"PARTITION `{pname}` VALUES LESS THAN ({upper})")
-    parts.append("PARTITION pmax VALUES LESS THAN (MAXVALUE)")
-    parts_sql = ",\n      ".join(parts)
-
-    # Create table partitioned by open_time (integer), subpartitioned by symbol
-    cur.execute(f"""
-    CREATE TABLE IF NOT EXISTS `{table_name}` (
-      `open_time` BIGINT UNSIGNED NOT NULL,
-      `symbol` VARCHAR(64) NOT NULL,
-      `open` DOUBLE NOT NULL,
-      `high` DOUBLE NOT NULL,
-      `low` DOUBLE NOT NULL,
-      `close` DOUBLE NOT NULL,
-      `volume` DOUBLE NOT NULL,
-      `close_time` BIGINT UNSIGNED NOT NULL,
-      `quote_volume` DOUBLE NOT NULL,
-      `count` INT NOT NULL,
-      `taker_buy_base_volume` DOUBLE NOT NULL,
-      `taker_buy_quote_volume` DOUBLE NOT NULL,
-      PRIMARY KEY (`open_time`, `symbol`)
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-    PARTITION BY RANGE (`open_time`)
-    SUBPARTITION BY KEY (`symbol`)
-    SUBPARTITIONS {subparts}
-    (
-      {parts_sql}
-    );
-    """)
+    ensure_database(cur)
+    ensure_klines_table(cur)
+    cur.execute(
+        """
+        SELECT COUNT(*)
+        FROM information_schema.COLUMNS
+        WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s AND COLUMN_NAME = 'symbol';
+        """,
+        (DB_NAME, table_name)
+    )
+    if cur.fetchone()[0] == 0:
+        raise RuntimeError(
+            f"Existing table `{DB_NAME}`.`{table_name}` needs a VARCHAR `symbol` column. "
+            "Drop/rename it or add the column before running the loader."
+        )
     conn.commit()
     cur.close()
+
+    ensure_monthly_partitions(conn, table_name, start_day, end_day)
+
+
+def ensure_monthly_partitions(conn, table_name: str, start_day: date, end_day: date, batch_size: int = 48):
+    """Ensure [start_day, end_day] months each have a dedicated partition."""
+    if end_day < start_day:
+        return
+
+    needed = []
+    for month_start in months_range(start_day, end_day):
+        pname = f"p{month_start.strftime('%Y%m')}"
+        upper = date_to_epoch_us(next_month(month_start))
+        needed.append((pname, upper))
+
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT PARTITION_NAME
+        FROM information_schema.PARTITIONS
+        WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s AND PARTITION_NAME IS NOT NULL;
+        """,
+        (DB_NAME, table_name)
+    )
+    existing = {row[0] for row in cur.fetchall() if row[0]}
+    cur.close()
+
+    missing = [(name, upper) for name, upper in needed if name not in existing]
+    if not missing:
+        return
+
+    start_idx = 0
+    while start_idx < len(missing):
+        chunk = missing[start_idx:start_idx + batch_size]
+        part_sql = ",\n          ".join(
+            f"PARTITION `{name}` VALUES LESS THAN ({upper})" for name, upper in chunk
+        )
+        alter_sql = f"""
+            ALTER TABLE `{table_name}`
+            REORGANIZE PARTITION `pmax` INTO (
+              {part_sql},
+              PARTITION `pmax` VALUES LESS THAN (MAXVALUE)
+            );
+        """
+        cur = conn.cursor()
+        cur.execute(alter_sql)
+        conn.commit()
+        cur.close()
+        start_idx += batch_size
 
 
 def check_local_infile_enabled(conn):
@@ -128,11 +189,8 @@ def tune_session_for_bulk_load(cur):
 
 
 def load_csv_into_mysql(csv_file_path: str, token: str, conn, table_name: str) -> int:
-    """Fast bulk load a Binance kline CSV into MySQL using LOAD DATA LOCAL INFILE.
+    """Fast bulk load a Binance kline CSV into MySQL using LOAD DATA LOCAL INFILE."""
 
-    Returns the number of rows reported inserted by the server (best-effort).
-    """
-    # Build SQL with literal filename and token, as some connectors don't support parameters for LOAD DATA
     def esc(s: str) -> str:
         return s.replace('\\', r'\\').replace("'", r"\'")
 
@@ -226,19 +284,6 @@ def process_monthly(date_range: str, folder_path: str, freq: str='1m', market_ty
 
     # Parse the overall date range once and precreate all needed partitions
     start_day, end_day = parse_date_range_str(date_range)
-    sql_connection = create_connection(DB_NAME)
-
-    # Diagnose LOCAL INFILE capability early, allow override via env to force fallback path
-    force_insert = os.environ.get('KLINE_LOAD_FORCE_INSERT', '0') in ('1', 'true', 'True')
-    use_local = check_local_infile_enabled(sql_connection) and not force_insert
-    if not use_local:
-        msg = "Using fallback batched INSERT loader (local_infile is OFF or forced). This is slower than LOAD DATA."
-        print(msg)
-    else:
-        print("Using LOAD DATA LOCAL INFILE fast path.")
-
-    ensure_table_created_with_partitions(sql_connection, table_name, start_day, end_day)
-    sql_connection.close()
 
     # Discover work
     work = {}
@@ -263,6 +308,24 @@ def process_monthly(date_range: str, folder_path: str, freq: str='1m', market_ty
         print(f"No files found under {tokens_dir}/<TOKEN>/{freq}/{date_range}. Nothing to load.")
         return
 
+    skip_checksum = os.environ.get('KLINE_SKIP_CHECKSUM', '0').lower() in ('1', 'true', 'yes')
+    if skip_checksum:
+        print('KLINE_SKIP_CHECKSUM=1 -> skipping checksum verification.')
+
+    sql_connection = create_connection(DB_NAME)
+
+    # Diagnose LOCAL INFILE capability early, allow override via env to force fallback path
+    force_insert = os.environ.get('KLINE_LOAD_FORCE_INSERT', '0') in ('1', 'true', 'True')
+    use_local = check_local_infile_enabled(sql_connection) and not force_insert
+    if not use_local:
+        msg = "Using fallback batched INSERT loader (local_infile is OFF or forced). This is slower than LOAD DATA."
+        print(msg)
+    else:
+        print("Using LOAD DATA LOCAL INFILE fast path.")
+
+    ensure_table_created_with_partitions(sql_connection, table_name, start_day, end_day)
+    sql_connection.close()
+
     print(f"Discovered {len(work)} tokens and {total_files} files to load into {DB_NAME}.{table_name}.")
 
     # Progress bars (thread-safe updates)
@@ -285,7 +348,8 @@ def process_monthly(date_range: str, folder_path: str, freq: str='1m', market_ty
         tune_session_for_bulk_load(cur)
         try:
             for (zip_file_path, checksum_file_path, zip_folder) in pairs:
-                verify_checksum(zip_file_path, checksum_file_path)
+                if not skip_checksum:
+                    verify_checksum(zip_file_path, checksum_file_path)
                 csv_file_path = unzip_file(zip_file_path, zip_folder)
                 try:
                     if use_local:
