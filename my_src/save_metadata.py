@@ -1,7 +1,7 @@
 import urllib.request
 import json
 
-from my_src.sql_connection import create_connection
+from my_src.sql_connection import create_connection, ensure_database_ready
 
 spot_url = "https://api.binance.com/api/v3/exchangeInfo"
 cm_url = "https://dapi.binance.com/dapi/v1/exchangeInfo"
@@ -23,26 +23,30 @@ def save_metadata():
     response = json.loads(response)
     symbol2pair_list = symbol2pair(response)
 
-    sql_connection = create_connection(f"binance_metadata")
+    ensure_database_ready("binance_metadata", install_timescaledb=False)
+    sql_connection = create_connection("binance_metadata")
     cur = sql_connection.cursor()
 
-    cur.execute(f"""
-            CREATE TABLE IF NOT EXISTS `spot_symbols` (
-              symbol VARCHAR(32) NOT NULL,
-              base_asset VARCHAR(32) NOT NULL,
-              quote_asset VARCHAR(32) NOT NULL,
-              PRIMARY KEY (symbol),
-              KEY idx_symbol (symbol)
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-            """)
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS spot_symbols (
+          symbol TEXT PRIMARY KEY,
+          base_asset TEXT NOT NULL,
+          quote_asset TEXT NOT NULL
+        );
+        """
+    )
 
-    insert_query = f"""
-            INSERT IGNORE INTO `spot_symbols` (
-              symbol, base_asset, quote_asset
-            ) VALUES (%s, %s, %s);
-            """
-
-    cur.executemany(insert_query, symbol2pair_list)
+    cur.executemany(
+        """
+        INSERT INTO spot_symbols(symbol, base_asset, quote_asset)
+        VALUES (%s, %s, %s)
+        ON CONFLICT (symbol) DO UPDATE
+        SET base_asset = EXCLUDED.base_asset,
+            quote_asset = EXCLUDED.quote_asset;
+        """,
+        symbol2pair_list,
+    )
     sql_connection.commit()
     cur.close()
     sql_connection.close()
