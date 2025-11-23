@@ -2,6 +2,8 @@ import os
 import hashlib
 import zipfile
 import sys
+import io
+from contextlib import contextmanager
 
 sys.path.append('../')
 
@@ -35,6 +37,19 @@ def unzip_file(zip_file_path, extract_dir):
         if not os.path.exists(csv_file_path):
             raise Exception(f"CSV file {csv_file_path} not found after extracting {zip_file_path}")
         return csv_file_path
+
+
+@contextmanager
+def open_csv_from_zip(zip_file_path):
+    base_name = os.path.splitext(os.path.basename(zip_file_path))[0]
+    with zipfile.ZipFile(zip_file_path, 'r') as zip_ref:
+        inner_name = f"{base_name}.csv"
+        if inner_name not in zip_ref.namelist():
+            raise Exception(f"CSV file {inner_name} not found inside {zip_file_path}")
+        with zip_ref.open(inner_name, 'r') as inner_file:
+            with io.TextIOWrapper(inner_file, encoding='utf-8') as text_stream:
+                yield text_stream
+
 
 def process_time(epoch_str):
     epoch = int(epoch_str)

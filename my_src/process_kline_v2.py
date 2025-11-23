@@ -1,7 +1,5 @@
 import os
 import sys
-import queue
-import threading
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, date
@@ -9,10 +7,13 @@ from datetime import datetime, date
 from psycopg2 import sql
 from tqdm import tqdm
 
-sys.path.append('../')
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+REPO_ROOT = os.path.abspath(os.path.join(BASE_DIR, '..'))
+if REPO_ROOT not in sys.path:
+    sys.path.append(REPO_ROOT)
 
-from my_src.file_utils import verify_checksum, unzip_file, process_time
-from my_src.sql_connection import create_connection, ensure_database_ready
+from my_src.file_utils import verify_checksum, open_csv_from_zip
+from my_src.sql_connection import create_connection
 
 
 DB_NAME = 'binance_marketdata'
@@ -91,6 +92,25 @@ def discover_monthly_work(tokens_dir: str, freq: str, date_range: str, start_mon
     return month_work, token_file_counts, total_files
 
 
+def finalize_table_load(table_name: str):
+    conn = create_connection(DB_NAME)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                sql.SQL(
+                    "ALTER TABLE {table_name} SET (autovacuum_enabled = true, toast.autovacuum_enabled = true);"
+                ).format(table_name=sql.Identifier(table_name))
+            )
+        conn.commit()
+        conn.autocommit = True
+        with conn.cursor() as cur:
+            cur.execute(
+                sql.SQL("VACUUM (ANALYZE) {table_name};").format(table_name=sql.Identifier(table_name))
+            )
+    finally:
+        conn.close()
+
+
 def ensure_tables(conn, table_name: str, chunk_days: int = 7, compress_after_days: int = 30):
     cur = conn.cursor()
     cur.execute("CREATE EXTENSION IF NOT EXISTS timescaledb;")
@@ -151,6 +171,11 @@ def ensure_tables(conn, table_name: str, chunk_days: int = 7, compress_after_day
             """,
             (table_name, compress_after_days * chunk_interval_us),
         )
+    cur.execute(
+        sql.SQL(
+            "ALTER TABLE {table_name} SET (autovacuum_enabled = false, toast.autovacuum_enabled = false);"
+        ).format(table_name=sql.Identifier(table_name))
+    )
     conn.commit()
     cur.close()
 
@@ -158,8 +183,8 @@ def ensure_tables(conn, table_name: str, chunk_days: int = 7, compress_after_day
 def prepare_ingest_session(conn):
     with conn.cursor() as cur:
         cur.execute("SET synchronous_commit TO OFF;")
-        cur.execute("SET temp_buffers = '32MB';")
-        cur.execute("SET work_mem = '64MB';")
+        cur.execute("SET temp_buffers = '64MB';")
+        cur.execute("SET work_mem = '128MB';")
         cur.execute(
             """
             CREATE TEMP TABLE IF NOT EXISTS tmp_kline_load (
@@ -181,11 +206,10 @@ def prepare_ingest_session(conn):
     conn.commit()
 
 
-def copy_csv_into_postgres(csv_file_path: str, token: str, conn, table_name: str):
+def copy_csv_stream_into_postgres(csv_stream, token: str, conn, table_name: str):
     with conn.cursor() as cur:
         cur.execute("TRUNCATE tmp_kline_load;")
-        with open(csv_file_path, 'r') as f:
-            cur.copy_expert("COPY tmp_kline_load FROM STDIN WITH (FORMAT CSV)", f)
+        cur.copy_expert("COPY tmp_kline_load FROM STDIN WITH (FORMAT CSV)", csv_stream)
         cur.execute(
             sql.SQL(
                 """
@@ -219,146 +243,86 @@ def copy_csv_into_postgres(csv_file_path: str, token: str, conn, table_name: str
             ).format(table_name=sql.Identifier(table_name)),
             (token,),
         )
-    conn.commit()
 
 
 def process_monthly(date_range: str, folder_path: str, freq: str = '1m', market_type: str = 'spot', data_type: str = 'klines'):
-    assert market_type in ['spot']
-    assert data_type in ['klines']
+    start_date, end_date = parse_date_range_str(date_range)
 
     tokens_dir = os.path.join(folder_path, 'data', market_type, 'monthly', data_type)
-    table_name = f"klines_{freq}"
+    month_work, token_file_counts, total_files = discover_monthly_work(tokens_dir, freq, date_range, start_date, end_date)
 
-    start_day, end_day = parse_date_range_str(date_range)
-    month_start_bound = first_of_month(start_day)
-    month_end_bound = first_of_month(end_day)
+    print(f"Discovered {total_files} files to process.")
 
-    month_work, token_file_counts, total_files = discover_monthly_work(
-        tokens_dir, freq, date_range, month_start_bound, month_end_bound
-    )
-
-    if total_files == 0:
-        print(f"No files found under {tokens_dir}/<TOKEN>/{freq}/{date_range}. Nothing to load.")
+    if not month_work:
+        print("No work found for the given date range and folder path.")
         return
 
     skip_checksum = os.environ.get('KLINE_SKIP_CHECKSUM', '0').lower() in ('1', 'true', 'yes')
     if skip_checksum:
         print('KLINE_SKIP_CHECKSUM=1 -> skipping checksum verification.')
 
-    ensure_database_ready(DB_NAME)
-    meta_conn = create_connection(DB_NAME)
-    ensure_tables(meta_conn, table_name)
-    meta_conn.close()
+    table_name = f"klines_{freq}"
 
-    ordered_months = sorted(month_work.keys())
-    print(
-        f"Discovered {len(token_file_counts)} tokens, {total_files} files "
-        f"across {len(ordered_months)} months to load into {DB_NAME}.{table_name}."
-    )
+    conn = create_connection(DB_NAME)
+    try:
+        ensure_tables(conn, table_name)
+        table_ready = True
+    except Exception as e:
+        print(f"Error ensuring tables: {e}", file=sys.stderr)
+        table_ready = False
+    finally:
+        conn.close()
 
-    file_pbar = tqdm(total=total_files, desc='Files', position=0, leave=True)
-    token_pbar = tqdm(total=len(token_file_counts), desc='Tokens', position=1, leave=True)
-    pbar_lock = threading.Lock()
-    token_remaining = dict(token_file_counts)
+    if not table_ready:
+        print("Table is not ready, aborting.")
+        return
 
-    def determine_worker_count() -> int:
-        env_workers = os.environ.get('KLINE_LOAD_WORKERS')
-        if not env_workers:
-            return min(24, max(8, (os.cpu_count() or 4)))
-        try:
-            return max(1, int(env_workers))
-        except ValueError:
-            return min(24, max(8, (os.cpu_count() or 4)))
+    with tqdm(total=total_files, desc="Processing files", unit="file") as pbar:
+        for month, tasks in sorted(month_work.items()):
+            month_str = month.strftime('%Y-%m')
+            conn = create_connection(DB_NAME)
+            try:
+                prepare_ingest_session(conn)
 
-    max_workers = determine_worker_count()
-
-    task_queue: queue.Queue = queue.Queue(maxsize=max_workers * 4)
-    stop_token = object()
-    error_event = threading.Event()
-    error_lock = threading.Lock()
-    worker_errors: list[tuple[str, str, Exception]] = []
-
-    def record_error(token: str, csv_path: str, exc: Exception):
-        error_event.set()
-        with error_lock:
-            worker_errors.append((token, csv_path, exc))
-
-    def worker_loop():
-        conn = create_connection(DB_NAME)
-        prepare_ingest_session(conn)
-        try:
-            while True:
-                item = task_queue.get()
-                if item is stop_token:
-                    task_queue.task_done()
-                    break
-                task = item  # FileTask
-                token = task.token
-                try:
-                    if not skip_checksum:
+                for task in tasks:
+                    if not skip_checksum and os.path.exists(task.checksum_path):
                         verify_checksum(task.zip_path, task.checksum_path)
-                    csv_path = unzip_file(task.zip_path, task.extract_dir)
-                    try:
-                        copy_csv_into_postgres(csv_path, token, conn, table_name)
-                    finally:
-                        if os.path.exists(csv_path):
-                            try:
-                                os.remove(csv_path)
-                            except OSError:
-                                pass
-                    with pbar_lock:
-                        file_pbar.update(1)
-                        if token in token_remaining:
-                            token_remaining[token] -= 1
-                            if token_remaining[token] == 0:
-                                token_pbar.update(1)
-                except Exception as exc:
-                    record_error(token, task.zip_path, exc)
-                finally:
-                    task_queue.task_done()
-        finally:
-            conn.close()
 
-    workers = []
-    for i in range(max_workers):
-        t = threading.Thread(target=worker_loop, name=f'loader-worker-{i}', daemon=True)
-        t.start()
-        workers.append(t)
+                    with open_csv_from_zip(task.zip_path) as csv_stream:
+                        copy_csv_stream_into_postgres(csv_stream, task.token, conn, table_name)
+
+                    pbar.set_postfix({"month": month_str, "token": task.token})
+                    pbar.update(1)
+
+            except Exception as e:
+                print(f"Error processing month {month_str}: {e}", file=sys.stderr)
+            finally:
+                conn.close()
 
     try:
-        for month_start in ordered_months:
-            tasks = month_work[month_start]
-            if not tasks:
-                continue
-            tqdm.write(f"Queueing {len(tasks)} files for {month_start.strftime('%Y-%m')} ...")
-            for task in tasks:
-                task_queue.put(task)
-            task_queue.join()
-            if error_event.is_set():
-                break
+        with open(os.path.join(folder_path, 'success_marker.txt'), 'a'):
+            pass
+    except Exception as e:
+        print(f"Error creating success marker: {e}", file=sys.stderr)
     finally:
-        for _ in workers:
-            task_queue.put(stop_token)
-        task_queue.join()
-        for t in workers:
-            t.join()
-
-    file_pbar.close()
-    token_pbar.close()
-
-    if worker_errors:
-        token, failing_file, exc = worker_errors[0]
-        raise RuntimeError(f"Worker failed for {token} ({os.path.basename(failing_file)}): {exc}") from exc
-
-    verify_conn = create_connection(DB_NAME)
-    vcur = verify_conn.cursor()
-    vcur.execute(sql.SQL("SELECT COUNT(*) FROM {};").format(sql.Identifier(table_name)))
-    total_rows = vcur.fetchone()[0]
-    vcur.close()
-    verify_conn.close()
-    print(f'Finished all loads. Table {DB_NAME}.{table_name} now has {total_rows} rows.')
+        if 'table_ready' in locals() and table_ready:
+            finalize_table_load(table_name)
 
 
 if __name__ == '__main__':
-    date_range, folder_path, freq, market_type, data_type = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
+    if len(sys.argv) != 6:
+        prog = os.path.basename(sys.argv[0])
+        print(
+            f"Usage: {prog} <DATE_RANGE> <FOLDER_PATH> <FREQ> <MARKET_TYPE> <DATA_TYPE>\n"
+            "Example: process_kline_v2.py 2020-01-01_2020-02-01 /data/binance 1m spot klines",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    date_range = sys.argv[1]
+    folder_path = sys.argv[2]
+    freq = sys.argv[3]
+    market_type = sys.argv[4]
+    data_type = sys.argv[5]
+
     process_monthly(date_range, folder_path, freq, market_type, data_type)

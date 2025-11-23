@@ -7,7 +7,7 @@ from psycopg2 import sql
 
 PG_HOST = os.environ.get('PGHOST', 'localhost')
 PG_SUPERUSER = os.environ.get('PGSUPERUSER', 'postgres')
-PG_SUPERUESR_PASSWORD = 'Postgre@123456'
+PG_SUPERUESR_PASSWORD = 'Postgres@123456'
 PG_SUPERUSER_DB = os.environ.get('PGSUPERDB', 'postgres')
 APP_DB_USER = 'local_write'
 APP_DB_PASSWORD = 'Abc@123456'
@@ -81,7 +81,7 @@ def ensure_database_exists(dbname: str):
 
 
 def ensure_database_ready(dbname: str, install_timescaledb: bool = True):
-    """Ensure role, database, and optional TimescaleDB extension are available."""
+    """Ensure role, database, schema privileges, and optional TimescaleDB extension are available."""
     ensure_database_exists(dbname)
     if install_timescaledb:
         with admin_cursor(dbname) as cur:
@@ -97,7 +97,35 @@ def ensure_database_ready(dbname: str, install_timescaledb: bool = True):
                     ) from exc
     with admin_cursor() as cur:
         cur.execute(
-            sql.SQL("GRANT ALL PRIVILEGES ON DATABASE {} TO {};").format(
+            sql.SQL("GRANT ALL PRIVILEGES ON DATABASE {} TO {};" ).format(
                 sql.Identifier(dbname), sql.Identifier(APP_DB_USER)
+            )
+        )
+    ensure_schema_privileges(dbname)
+
+
+def ensure_schema_privileges(dbname: str, schema: str = 'public'):
+    with admin_cursor(dbname) as cur:
+        cur.execute(
+            sql.SQL("GRANT USAGE, CREATE ON SCHEMA {} TO {};").format(
+                sql.Identifier(schema), sql.Identifier(APP_DB_USER)
+            )
+        )
+        cur.execute(
+            sql.SQL(
+                "ALTER DEFAULT PRIVILEGES FOR ROLE {} IN SCHEMA {} GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO {};"
+            ).format(
+                sql.Identifier(APP_DB_USER),
+                sql.Identifier(schema),
+                sql.Identifier(APP_DB_USER),
+            )
+        )
+        cur.execute(
+            sql.SQL(
+                "ALTER DEFAULT PRIVILEGES FOR ROLE {} IN SCHEMA {} GRANT USAGE, SELECT ON SEQUENCES TO {};"
+            ).format(
+                sql.Identifier(APP_DB_USER),
+                sql.Identifier(schema),
+                sql.Identifier(APP_DB_USER),
             )
         )
