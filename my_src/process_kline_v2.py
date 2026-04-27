@@ -1,8 +1,11 @@
 import os
 import sys
-from collections import defaultdict
+import time
+from collections import defaultdict, Counter
 from dataclasses import dataclass
 from datetime import datetime, date
+from queue import Queue
+from threading import Thread, Lock
 
 from psycopg2 import sql
 from tqdm import tqdm
@@ -17,6 +20,19 @@ from my_src.sql_connection import create_connection
 
 
 DB_NAME = 'binance_marketdata'
+TMP_RAW_TABLE = 'tmp_kline_raw'
+TMP_STAGE_TABLE = 'tmp_kline_stage'
+
+
+def _read_int_env(var_name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(var_name, default))
+    except (TypeError, ValueError):
+        return default
+
+
+BATCH_MAX_ROWS = max(0, _read_int_env('KLINE_BATCH_ROWS', 500_000))
+BATCH_MAX_FILES = max(0, _read_int_env('KLINE_BATCH_FILES', 8))
 
 
 @dataclass(frozen=True)
@@ -186,34 +202,64 @@ def prepare_ingest_session(conn):
         cur.execute("SET temp_buffers = '64MB';")
         cur.execute("SET work_mem = '128MB';")
         cur.execute(
-            """
-            CREATE TEMP TABLE IF NOT EXISTS tmp_kline_load (
-              open_time_text TEXT,
-              open DOUBLE PRECISION,
-              high DOUBLE PRECISION,
-              low DOUBLE PRECISION,
-              close DOUBLE PRECISION,
-              volume DOUBLE PRECISION,
-              close_time_text TEXT,
-              quote_volume DOUBLE PRECISION,
-              count BIGINT,
-              taker_buy_base_volume DOUBLE PRECISION,
-              taker_buy_quote_volume DOUBLE PRECISION,
-              ignore TEXT
-            ) ON COMMIT DELETE ROWS;
-            """
+            sql.SQL(
+                """
+                CREATE TEMP TABLE IF NOT EXISTS {raw_table} (
+                  open_time_text TEXT,
+                  open DOUBLE PRECISION,
+                  high DOUBLE PRECISION,
+                  low DOUBLE PRECISION,
+                  close DOUBLE PRECISION,
+                  volume DOUBLE PRECISION,
+                  close_time_text TEXT,
+                  quote_volume DOUBLE PRECISION,
+                  count BIGINT,
+                  taker_buy_base_volume DOUBLE PRECISION,
+                  taker_buy_quote_volume DOUBLE PRECISION,
+                  ignore TEXT
+                ) ON COMMIT DELETE ROWS;
+                """
+            ).format(raw_table=sql.Identifier(TMP_RAW_TABLE))
+        )
+        cur.execute(
+            sql.SQL(
+                """
+                CREATE TEMP TABLE IF NOT EXISTS {stage_table} (
+                  open_time BIGINT NOT NULL,
+                  symbol TEXT NOT NULL,
+                  open DOUBLE PRECISION NOT NULL,
+                  high DOUBLE PRECISION NOT NULL,
+                  low DOUBLE PRECISION NOT NULL,
+                  close DOUBLE PRECISION NOT NULL,
+                  volume DOUBLE PRECISION NOT NULL,
+                  close_time BIGINT NOT NULL,
+                  quote_volume DOUBLE PRECISION NOT NULL,
+                  count BIGINT NOT NULL,
+                  taker_buy_base_volume DOUBLE PRECISION NOT NULL,
+                  taker_buy_quote_volume DOUBLE PRECISION NOT NULL
+                ) ON COMMIT DELETE ROWS;
+                """
+            ).format(stage_table=sql.Identifier(TMP_STAGE_TABLE))
+        )
+        cur.execute(
+            sql.SQL("TRUNCATE {raw_table};").format(raw_table=sql.Identifier(TMP_RAW_TABLE))
+        )
+        cur.execute(
+            sql.SQL("TRUNCATE {stage_table};").format(stage_table=sql.Identifier(TMP_STAGE_TABLE))
         )
     conn.commit()
 
 
-def copy_csv_stream_into_postgres(csv_stream, token: str, conn, table_name: str):
+def copy_csv_stream_into_postgres(csv_stream, token: str, conn):
     with conn.cursor() as cur:
-        cur.execute("TRUNCATE tmp_kline_load;")
-        cur.copy_expert("COPY tmp_kline_load FROM STDIN WITH (FORMAT CSV)", csv_stream)
+        cur.copy_expert(
+            sql.SQL("COPY {raw_table} FROM STDIN WITH (FORMAT CSV)").format(raw_table=sql.Identifier(TMP_RAW_TABLE)),
+            csv_stream,
+        )
         cur.execute(
             sql.SQL(
                 """
-                INSERT INTO {table_name}
+                INSERT INTO {stage_table}
                 (open_time, symbol, open, high, low, close, volume, close_time, quote_volume, count, taker_buy_base_volume, taker_buy_quote_volume)
                 SELECT
                   CASE
@@ -236,12 +282,32 @@ def copy_csv_stream_into_postgres(csv_stream, token: str, conn, table_name: str)
                   count,
                   taker_buy_base_volume,
                   taker_buy_quote_volume
-                FROM tmp_kline_load
-                WHERE open_time_text IS NOT NULL AND close_time_text IS NOT NULL
+                FROM {raw_table}
+                WHERE open_time_text IS NOT NULL AND close_time_text IS NOT NULL;
+                """
+            ).format(stage_table=sql.Identifier(TMP_STAGE_TABLE), raw_table=sql.Identifier(TMP_RAW_TABLE)),
+            (token,),
+        )
+        cur.execute(
+            sql.SQL("TRUNCATE {raw_table};").format(raw_table=sql.Identifier(TMP_RAW_TABLE))
+        )
+
+
+def flush_stage_into_target(conn, table_name: str):
+    with conn.cursor() as cur:
+        cur.execute(
+            sql.SQL(
+                """
+                INSERT INTO {table_name}
+                (open_time, symbol, open, high, low, close, volume, close_time, quote_volume, count, taker_buy_base_volume, taker_buy_quote_volume)
+                SELECT open_time, symbol, open, high, low, close, volume, close_time, quote_volume, count, taker_buy_base_volume, taker_buy_quote_volume
+                FROM {stage_table}
                 ON CONFLICT (open_time, symbol) DO NOTHING;
                 """
-            ).format(table_name=sql.Identifier(table_name)),
-            (token,),
+            ).format(table_name=sql.Identifier(table_name), stage_table=sql.Identifier(TMP_STAGE_TABLE))
+        )
+        cur.execute(
+            sql.SQL("TRUNCATE {stage_table};").format(stage_table=sql.Identifier(TMP_STAGE_TABLE))
         )
 
 
@@ -277,27 +343,100 @@ def process_monthly(date_range: str, folder_path: str, freq: str = '1m', market_
         print("Table is not ready, aborting.")
         return
 
-    with tqdm(total=total_files, desc="Processing files", unit="file") as pbar:
-        for month, tasks in sorted(month_work.items()):
-            month_str = month.strftime('%Y-%m')
-            conn = create_connection(DB_NAME)
-            try:
-                prepare_ingest_session(conn)
+    total_workers = os.environ.get('KLINE_WORKERS')
+    if total_workers is None:
+        cpu_guess = os.cpu_count() or 1
+        total_workers = min(12, max(1, cpu_guess))
+    else:
+        total_workers = max(1, int(total_workers))
 
-                for task in tasks:
+    task_queue: Queue[tuple[str, FileTask]] = Queue()
+    progress_lock = Lock()
+    error_lock = Lock()
+    worker_stats: Counter[int] = Counter()
+    worker_last_active: dict[int, float] = {}
+    errors: list[str] = []
+
+    for month, tasks in sorted(month_work.items()):
+        month_str = month.strftime('%Y-%m')
+        for task in tasks:
+            task_queue.put((month_str, task))
+
+    def worker_main(worker_id: int, pbar):
+        conn = create_connection(DB_NAME)
+        staged_rows = 0
+        staged_files = 0
+        try:
+            prepare_ingest_session(conn)
+            while True:
+                item = task_queue.get()
+                if item is None:
+                    task_queue.task_done()
+                    break
+                month_str, task = item
+                try:
                     if not skip_checksum and os.path.exists(task.checksum_path):
                         verify_checksum(task.zip_path, task.checksum_path)
 
                     with open_csv_from_zip(task.zip_path) as csv_stream:
-                        copy_csv_stream_into_postgres(csv_stream, task.token, conn, table_name)
+                        copy_csv_stream_into_postgres(csv_stream, task.token, conn)
 
-                    pbar.set_postfix({"month": month_str, "token": task.token})
-                    pbar.update(1)
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            sql.SQL("SELECT COUNT(*) FROM {stage_table};").format(stage_table=sql.Identifier(TMP_STAGE_TABLE))
+                        )
+                        staged_rows = cur.fetchone()[0]
+                    staged_files += 1
 
-            except Exception as e:
-                print(f"Error processing month {month_str}: {e}", file=sys.stderr)
-            finally:
-                conn.close()
+                    if (BATCH_MAX_FILES and staged_files >= BATCH_MAX_FILES) or (BATCH_MAX_ROWS and staged_rows >= BATCH_MAX_ROWS):
+                        flush_stage_into_target(conn, table_name)
+                        staged_rows = 0
+                        staged_files = 0
+
+                except Exception as exc:
+                    msg = f"Worker {worker_id} failed for {task.token} ({month_str}): {exc}"
+                    print(msg, file=sys.stderr)
+                    with error_lock:
+                        errors.append(msg)
+                finally:
+                    with progress_lock:
+                        worker_stats[worker_id] += 1
+                        worker_last_active[worker_id] = time.monotonic()
+                        queue_depth = task_queue.qsize()
+                        if worker_last_active:
+                            busiest_worker = max(worker_last_active.items(), key=lambda item: item[1])[0]
+                        else:
+                            busiest_worker = worker_id
+                        pbar.set_postfix({
+                            "last": worker_id,
+                            "busy": busiest_worker,
+                            "queue": queue_depth,
+                            "stage_rows": staged_rows,
+                        })
+                        pbar.update(1)
+                    task_queue.task_done()
+            if staged_rows:
+                flush_stage_into_target(conn, table_name)
+        finally:
+            conn.close()
+
+    with tqdm(total=total_files, desc="Processing files", unit="file") as pbar:
+        workers: list[Thread] = []
+        for idx in range(total_workers):
+            thread = Thread(target=worker_main, args=(idx + 1, pbar), daemon=True)
+            thread.start()
+            workers.append(thread)
+
+        for _ in workers:
+            task_queue.put(None)
+
+        task_queue.join()
+
+        for thread in workers:
+            thread.join()
+
+    if errors:
+        print(f"Completed with {len(errors)} errors. See logs above for details.", file=sys.stderr)
 
     try:
         with open(os.path.join(folder_path, 'success_marker.txt'), 'a'):
