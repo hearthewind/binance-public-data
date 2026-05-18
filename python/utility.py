@@ -1,4 +1,5 @@
-import os, sys, re, shutil, logging, time
+import os, sys, re, shutil, logging
+import time as _time
 from pathlib import Path
 from datetime import *
 import requests
@@ -54,7 +55,7 @@ def get_all_symbols(type):
                 raise
             wait = min(2 ** attempt, 120)
             _logger.warning("Symbol fetch attempt %d/%d failed (%s) — retrying in %ds", attempt, MAX_RETRIES, e, wait)
-            time.sleep(wait)
+            _time.sleep(wait)
 
 
 def download_file(base_path, file_name, date_range=None, folder=None):
@@ -78,7 +79,7 @@ def download_file(base_path, file_name, date_range=None, folder=None):
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             _logger.info("DOWNLOADING%s | %s", "" if attempt == 1 else f" (retry {attempt-1}/{MAX_RETRIES-1})", file_name)
-            t0 = time.monotonic()
+            t0 = _time.monotonic()
 
             response = requests.get(download_url, stream=True, timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
 
@@ -112,7 +113,7 @@ def download_file(base_path, file_name, date_range=None, folder=None):
                     os.remove(save_path)
                 raise
 
-            elapsed = time.monotonic() - t0
+            elapsed = _time.monotonic() - t0
             _logger.info("\nOK          | %s (%.1fs)", file_name, elapsed)
             return
 
@@ -127,7 +128,7 @@ def download_file(base_path, file_name, date_range=None, folder=None):
                 return
             wait = min(2 ** attempt, 120)
             _logger.warning("RETRY %d/%d  | %s — %s — waiting %ds", attempt, MAX_RETRIES - 1, file_name, e, wait)
-            time.sleep(wait)
+            _time.sleep(wait)
 
         except Exception as e:
             _logger.error("ERROR       | %s — %s", file_name, e)
