@@ -1,17 +1,17 @@
 """
-Kline (OHLCV) ingestion pipeline.
+Trade tick ingestion pipeline.
 
-Reads monthly kline zip archives downloaded by the Binance public-data
+Reads monthly trade zip archives downloaded by the Binance public-data
 downloader and bulk-loads them into a TimescaleDB hypertable.
 
-Table naming convention: ``{market_type}_klines_{freq}``
-  e.g.  spot_klines_1m,  futures_um_klines_1h,  futures_cm_klines_4h
+Table naming convention: ``{market_type}_trades``
+  e.g.  spot_trades,  futures_um_trades,  futures_cm_trades
 
 Usage::
 
-    python process_kline_v2.py <DATE_RANGE> <FOLDER_PATH> <FREQ> <MARKET_TYPE> <DATA_TYPE>
-    python process_kline_v2.py 2024-01-01_2024-02-01 /data/binance 1m spot klines
-    python process_kline_v2.py 2024-01-01_2024-02-01 /data/binance 1h futures/um klines
+    python process_trades.py <DATE_RANGE> <FOLDER_PATH> <MARKET_TYPE> <DATA_TYPE>
+    python process_trades.py 2020-01-01_2025-09-30 /data/binance/trade spot trades
+    python process_trades.py 2020-01-01_2025-09-30 /data/binance/trade futures_um trades
 """
 import os
 import sys
@@ -34,83 +34,63 @@ from my_src.bulk_loader import (
 from my_src.sql_connection import create_connection
 
 
-TMP_RAW_TABLE = 'tmp_kline_raw'
+TMP_RAW_TABLE = 'tmp_trade_raw'
 
 
 # ── table setup ───────────────────────────────────────────────────────────────
 
 def ensure_tables(conn, table_name: str, chunk_days: int = 30, compress_after_days: int = 90):
-    """
-    Create the kline hypertable if it doesn't exist.
-
-    chunk_days=30: 30-day chunks give ~43 k rows/symbol/chunk for 1m data,
-    which is in TimescaleDB's recommended range and reduces chunk count for
-    backtesting range queries that span months.
-
-    compress_after_days=90: compress chunks older than 90 days automatically.
-    """
-    index_name = f"{table_name}_symbol_open_time_idx"
+    """Create the trades hypertable and compression policy if they don't exist."""
+    index_name = f"{table_name}_symbol_time_idx"
 
     cur = conn.cursor()
     cur.execute("CREATE EXTENSION IF NOT EXISTS timescaledb;")
     cur.execute(
         sql.SQL(
             """
-            CREATE TABLE IF NOT EXISTS {table_name} (
-              open_time              BIGINT           NOT NULL,
-              symbol                 TEXT             NOT NULL,
-              open                   DOUBLE PRECISION NOT NULL,
-              high                   DOUBLE PRECISION NOT NULL,
-              low                    DOUBLE PRECISION NOT NULL,
-              close                  DOUBLE PRECISION NOT NULL,
-              volume                 DOUBLE PRECISION NOT NULL,
-              close_time             BIGINT           NOT NULL,
-              quote_volume           DOUBLE PRECISION NOT NULL,
-              count                  BIGINT           NOT NULL,
-              taker_buy_base_volume  DOUBLE PRECISION NOT NULL,
-              taker_buy_quote_volume DOUBLE PRECISION NOT NULL,
-              PRIMARY KEY (open_time, symbol)
+            CREATE TABLE IF NOT EXISTS {t} (
+              time           BIGINT  NOT NULL,
+              symbol         TEXT    NOT NULL,
+              trade_id       BIGINT  NOT NULL,
+              price          DOUBLE PRECISION NOT NULL,
+              qty            DOUBLE PRECISION NOT NULL,
+              quote_qty      DOUBLE PRECISION NOT NULL,
+              is_buyer_maker BOOLEAN NOT NULL,
+              is_best_match  BOOLEAN NOT NULL,
+              PRIMARY KEY (time, symbol, trade_id)
             );
             """
-        ).format(table_name=sql.Identifier(table_name))
+        ).format(t=sql.Identifier(table_name))
     )
 
-    # open_time is stored in microseconds; chunk interval in same unit
+    # time is stored in microseconds; chunk interval in same unit
     chunk_interval_us = chunk_days * 24 * 60 * 60 * 1_000_000
     cur.execute(
-        """
-        SELECT create_hypertable(%s::regclass, 'open_time',
-            chunk_time_interval => %s, if_not_exists => TRUE);
-        """,
+        "SELECT create_hypertable(%s::regclass, 'time', chunk_time_interval => %s, if_not_exists => TRUE);",
         (table_name, chunk_interval_us),
     )
 
     cur.execute(
-        sql.SQL(
-            "CREATE INDEX IF NOT EXISTS {idx} ON {table_name} (symbol, open_time);"
-        ).format(
+        sql.SQL("CREATE INDEX IF NOT EXISTS {idx} ON {t} (symbol, time);").format(
             idx=sql.Identifier(index_name),
-            table_name=sql.Identifier(table_name),
+            t=sql.Identifier(table_name),
         )
     )
 
-    # compress_orderby ASC matches how range scans decompress data (oldest first)
     cur.execute(
         sql.SQL(
-            "ALTER TABLE {table_name} SET ("
+            "ALTER TABLE {t} SET ("
             "  timescaledb.compress = true,"
             "  timescaledb.compress_segmentby = 'symbol',"
-            "  timescaledb.compress_orderby = 'open_time ASC'"
+            "  timescaledb.compress_orderby = 'time ASC'"
             ");"
-        ).format(table_name=sql.Identifier(table_name))
+        ).format(t=sql.Identifier(table_name))
     )
 
     compress_after_us = compress_after_days * 24 * 60 * 60 * 1_000_000
     cur.execute(
-        """
-        SELECT job_id FROM timescaledb_information.jobs
-        WHERE hypertable_name = %s AND application_name = 'Compression Policy';
-        """,
+        "SELECT job_id FROM timescaledb_information.jobs "
+        "WHERE hypertable_name = %s AND application_name = 'Compression Policy';",
         (table_name,),
     )
     if not cur.fetchone():
@@ -122,11 +102,8 @@ def ensure_tables(conn, table_name: str, chunk_days: int = 30, compress_after_da
     # Disable autovacuum during bulk load — re-enabled in finalize_bulk_load
     cur.execute(
         sql.SQL(
-            "ALTER TABLE {table_name} SET ("
-            "  autovacuum_enabled = false,"
-            "  toast.autovacuum_enabled = false"
-            ");"
-        ).format(table_name=sql.Identifier(table_name))
+            "ALTER TABLE {t} SET (autovacuum_enabled = false, toast.autovacuum_enabled = false);"
+        ).format(t=sql.Identifier(table_name))
     )
     conn.commit()
     cur.close()
@@ -145,18 +122,13 @@ def prepare_ingest_session(conn):
             sql.SQL(
                 """
                 CREATE TEMP TABLE IF NOT EXISTS {raw_table} (
-                  open_time_text         TEXT,
-                  open                   DOUBLE PRECISION,
-                  high                   DOUBLE PRECISION,
-                  low                    DOUBLE PRECISION,
-                  close                  DOUBLE PRECISION,
-                  volume                 DOUBLE PRECISION,
-                  close_time_text        TEXT,
-                  quote_volume           DOUBLE PRECISION,
-                  count                  BIGINT,
-                  taker_buy_base_volume  DOUBLE PRECISION,
-                  taker_buy_quote_volume DOUBLE PRECISION,
-                  ignore                 TEXT
+                  trade_id_text  TEXT,
+                  price          DOUBLE PRECISION,
+                  qty            DOUBLE PRECISION,
+                  quote_qty      DOUBLE PRECISION,
+                  time_text      TEXT,
+                  is_buyer_maker TEXT,
+                  is_best_match  TEXT
                 ) ON COMMIT DELETE ROWS;
                 """
             ).format(raw_table=sql.Identifier(TMP_RAW_TABLE))
@@ -170,10 +142,7 @@ def prepare_ingest_session(conn):
 # ── per-file copy ─────────────────────────────────────────────────────────────
 
 def copy_csv_and_flush(csv_stream, token: str, conn, table_name: str):
-    """
-    COPY one CSV file into the raw temp table, transform and insert directly
-    into the target hypertable, then clear the temp table.
-    """
+    """COPY one trade CSV into the raw temp table, transform and upsert into the hypertable."""
     with conn.cursor() as cur:
         cur.copy_expert(
             sql.SQL("COPY {raw_table} FROM STDIN WITH (FORMAT CSV)").format(
@@ -184,32 +153,26 @@ def copy_csv_and_flush(csv_stream, token: str, conn, table_name: str):
         cur.execute(
             sql.SQL(
                 """
-                INSERT INTO {table_name}
-                  (open_time, symbol, open, high, low, close, volume,
-                   close_time, quote_volume, count,
-                   taker_buy_base_volume, taker_buy_quote_volume)
+                INSERT INTO {t} (time, symbol, trade_id, price, qty, quote_qty, is_buyer_maker, is_best_match)
                 SELECT
                   CASE
-                    WHEN length(open_time_text) = 13 THEN open_time_text::BIGINT * 1000
-                    WHEN length(open_time_text) = 16 THEN open_time_text::BIGINT
+                    WHEN length(time_text) = 13 THEN time_text::BIGINT * 1000
+                    WHEN length(time_text) = 16 THEN time_text::BIGINT
                     ELSE NULL
                   END,
                   %s,
-                  open, high, low, close, volume,
-                  CASE
-                    WHEN length(close_time_text) = 13 THEN close_time_text::BIGINT * 1000
-                    WHEN length(close_time_text) = 16 THEN close_time_text::BIGINT
-                    ELSE NULL
-                  END,
-                  quote_volume, count,
-                  taker_buy_base_volume, taker_buy_quote_volume
+                  trade_id_text::BIGINT,
+                  price,
+                  qty,
+                  quote_qty,
+                  is_buyer_maker::BOOLEAN,
+                  is_best_match::BOOLEAN
                 FROM {raw_table}
-                WHERE open_time_text IS NOT NULL
-                  AND close_time_text IS NOT NULL
-                ON CONFLICT (open_time, symbol) DO NOTHING;
+                WHERE trade_id_text IS NOT NULL AND time_text IS NOT NULL
+                ON CONFLICT (time, symbol, trade_id) DO NOTHING;
                 """
             ).format(
-                table_name=sql.Identifier(table_name),
+                t=sql.Identifier(table_name),
                 raw_table=sql.Identifier(TMP_RAW_TABLE),
             ),
             (token,),
@@ -225,23 +188,24 @@ def copy_csv_and_flush(csv_stream, token: str, conn, table_name: str):
 def process_monthly(
     date_range: str,
     folder_path: str,
-    freq: str = '1m',
     market_type: str = 'spot',
-    data_type: str = 'klines',
+    data_type: str = 'trades',
 ):
     """
-    Load all monthly kline zip files for the given parameters into PostgreSQL.
+    Load all monthly trade zip files for the given parameters into PostgreSQL.
 
-    Table created/targeted: ``{market_type}_klines_{freq}``
+    Table created/targeted: ``{market_type}_trades``
+    Note: trades have no freq subdirectory in the Binance archive layout.
     """
     start_date, end_date = parse_date_range_str(date_range)
 
-    table_name = f"{market_type}_klines_{freq}"
-    index_name = f"{table_name}_symbol_open_time_idx"
+    table_name = f"{market_type}_trades"
+    index_name = f"{table_name}_symbol_time_idx"
 
+    # Trades path: data/{market_type}/monthly/{data_type}/{TOKEN}/{date_range}/
     tokens_dir = os.path.join(folder_path, 'data', market_type, 'monthly', data_type)
     month_work, _, total_files = discover_monthly_work(
-        tokens_dir, date_range, start_date, end_date, freq=freq
+        tokens_dir, date_range, start_date, end_date, freq=None
     )
 
     print(f"Table: {table_name}  |  Discovered {total_files} files to process.")
@@ -249,9 +213,9 @@ def process_monthly(
         print("No work found for the given date range and folder path.")
         return
 
-    skip_checksum = os.environ.get('KLINE_SKIP_CHECKSUM', '0').lower() in ('1', 'true', 'yes')
+    skip_checksum = os.environ.get('TRADE_SKIP_CHECKSUM', '0').lower() in ('1', 'true', 'yes')
     if skip_checksum:
-        print('KLINE_SKIP_CHECKSUM=1 -> skipping checksum verification.')
+        print('TRADE_SKIP_CHECKSUM=1 -> skipping checksum verification.')
 
     # -- Table setup -----------------------------------------------------------
     conn = create_connection(DB_NAME)
@@ -268,7 +232,7 @@ def process_monthly(
     prepare_bulk_load(table_name, index_name)
 
     # -- Worker pool -----------------------------------------------------------
-    num_workers_env = os.environ.get('KLINE_WORKERS')
+    num_workers_env = os.environ.get('TRADE_WORKERS')
     num_workers = int(num_workers_env) if num_workers_env else min(12, max(1, os.cpu_count() or 1))
 
     errors = run_worker_pool(
@@ -286,7 +250,7 @@ def process_monthly(
 
     # -- Post-load: restore durability, rebuild index, compress, analyse -------
     print("\nFinalising bulk load...")
-    finalize_bulk_load(table_name, index_name, "symbol, open_time")
+    finalize_bulk_load(table_name, index_name, "symbol, time")
 
     try:
         with open(os.path.join(folder_path, 'success_marker.txt'), 'a'):
@@ -296,11 +260,11 @@ def process_monthly(
 
 
 if __name__ == '__main__':
-    if len(sys.argv) != 6:
+    if len(sys.argv) != 5:
         prog = os.path.basename(sys.argv[0])
         print(
-            f"Usage: {prog} <DATE_RANGE> <FOLDER_PATH> <FREQ> <MARKET_TYPE> <DATA_TYPE>\n"
-            "Example: process_kline_v2.py 2024-01-01_2024-02-01 /data/binance 1m spot klines",
+            f"Usage: {prog} <DATE_RANGE> <FOLDER_PATH> <MARKET_TYPE> <DATA_TYPE>\n"
+            "Example: process_trades.py 2020-01-01_2025-09-30 /data/binance/trade spot trades",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -308,7 +272,6 @@ if __name__ == '__main__':
     process_monthly(
         date_range=sys.argv[1],
         folder_path=sys.argv[2],
-        freq=sys.argv[3],
-        market_type=sys.argv[4],
-        data_type=sys.argv[5],
+        market_type=sys.argv[3],
+        data_type=sys.argv[4],
     )

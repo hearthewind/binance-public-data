@@ -1,11 +1,8 @@
 import os
 import hashlib
 import zipfile
-import sys
 import io
 from contextlib import contextmanager
-
-sys.path.append('../')
 
 
 def verify_checksum(zip_file_path, checksum_file_path):

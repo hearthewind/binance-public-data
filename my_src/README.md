@@ -1,7 +1,7 @@
 # ETL — my_src
 
-Custom ETL scripts that load Binance public data CSV archives into
-PostgreSQL / TimescaleDB.
+Custom ETL scripts that load Binance public data CSV archives (klines and
+trades) into PostgreSQL / TimescaleDB.
 
 ## Setup
 
@@ -20,6 +20,23 @@ pip install psycopg2-binary python-dotenv tqdm
 
 ---
 
+## Architecture
+
+Shared bulk-load infrastructure lives in **`bulk_loader.py`**:
+
+| Function | Purpose |
+|----------|---------|
+| `discover_monthly_work` | Scan archive directory, build `{month: [FileTask]}` map |
+| `prepare_bulk_load` | `SET UNLOGGED` + drop secondary index before bulk insert |
+| `finalize_bulk_load` | `SET LOGGED` → rebuild index → compress chunks → `VACUUM ANALYZE` |
+| `run_worker_pool` | Threaded pool; calls per-file callbacks supplied by the caller |
+
+Both `process_kline_v2.py` and `process_trades.py` import from `bulk_loader.py`
+and only implement the data-type-specific pieces (schema, session setup, CSV
+transform).
+
+---
+
 ## Loading klines
 
 ```bash
@@ -28,15 +45,33 @@ python process_kline_v2.py <DATE_RANGE> <DATA_ROOT> <FREQ> <MARKET_TYPE> <DATA_T
 # Examples
 python process_kline_v2.py 2024-01-01_2024-02-01 /data/binance 1m spot klines
 python process_kline_v2.py 2024-01-01_2024-02-01 /data/binance 1h futures/um klines
+python process_kline_v2.py 2024-01-01_2024-02-01 /data/binance 4h futures/cm klines
 ```
 
-Table name created: `{market_type}_klines_{freq}` — e.g. `spot_klines_1m`.
+**Table created:** `{market_type}_klines_{freq}` — e.g. `spot_klines_1m`, `futures_um_klines_1h`.
 
-**Bulk-load strategy** for speed:
-1. `ALTER TABLE SET UNLOGGED` — skips WAL during load (3–5× speedup)
-2. Parallel workers (configurable via `KLINE_WORKERS` env var)
-3. Per-connection temp table + `COPY` → transform → `INSERT ON CONFLICT DO NOTHING`
-4. After all workers finish: `SET LOGGED` → rebuild index → compress chunks → `VACUUM ANALYZE`
+Env knob: `KLINE_WORKERS` (default: `min(12, cpu_count)`), `KLINE_SKIP_CHECKSUM=1`.
+
+---
+
+## Loading trades
+
+```bash
+python process_trades.py <DATE_RANGE> <DATA_ROOT> <MARKET_TYPE> <DATA_TYPE>
+
+# Examples
+python process_trades.py 2020-01-01_2025-09-30 /data/binance/trade spot trades
+python process_trades.py 2020-01-01_2025-09-30 /data/binance/trade futures_um trades
+```
+
+**Table created:** `{market_type}_trades` — e.g. `spot_trades`, `futures_um_trades`.
+
+Trades have no frequency dimension — the archive path is
+`data/{market_type}/monthly/trades/{SYMBOL}/{DATE_RANGE}/`.
+
+Env knob: `TRADE_WORKERS` (default: `min(12, cpu_count)`), `TRADE_SKIP_CHECKSUM=1`.
+
+---
 
 ## Loading symbol metadata
 
@@ -46,7 +81,17 @@ python save_metadata.py futures_um    # → binance_metadata.futures_um_symbols
 python save_metadata.py futures_cm    # → binance_metadata.futures_cm_symbols
 ```
 
+---
+
 ## Database schema
+
+### Table naming convention
+
+| Data type | Convention | Example |
+|-----------|-----------|---------|
+| Klines | `{market_type}_klines_{freq}` | `spot_klines_1m` |
+| Trades | `{market_type}_trades` | `spot_trades` |
+| Symbols | `{market_type}_symbols` | `spot_symbols` |
 
 ### Klines hypertable
 
@@ -60,14 +105,32 @@ CREATE TABLE spot_klines_1m (
   close       DOUBLE PRECISION NOT NULL,
   volume      DOUBLE PRECISION NOT NULL,
   close_time  BIGINT NOT NULL,
-  quote_volume          DOUBLE PRECISION NOT NULL,
-  count                 BIGINT NOT NULL,
+  quote_volume           DOUBLE PRECISION NOT NULL,
+  count                  BIGINT NOT NULL,
   taker_buy_base_volume  DOUBLE PRECISION NOT NULL,
   taker_buy_quote_volume DOUBLE PRECISION NOT NULL,
   PRIMARY KEY (open_time, symbol)
 );
 -- TimescaleDB hypertable, 30-day chunks, compressed after 90 days
--- Index: (symbol, open_time) for fast per-symbol range scans
+-- Index: (symbol, open_time)
+```
+
+### Trades hypertable
+
+```sql
+CREATE TABLE spot_trades (
+  time           BIGINT  NOT NULL,  -- epoch microseconds (16 digits)
+  symbol         TEXT    NOT NULL,
+  trade_id       BIGINT  NOT NULL,
+  price          DOUBLE PRECISION NOT NULL,
+  qty            DOUBLE PRECISION NOT NULL,
+  quote_qty      DOUBLE PRECISION NOT NULL,
+  is_buyer_maker BOOLEAN NOT NULL,
+  is_best_match  BOOLEAN NOT NULL,
+  PRIMARY KEY (time, symbol, trade_id)
+);
+-- TimescaleDB hypertable, 30-day chunks, compressed after 90 days
+-- Index: (symbol, time)
 ```
 
 ### Symbols table
@@ -79,3 +142,12 @@ CREATE TABLE spot_symbols (
   quote_asset TEXT NOT NULL
 );
 ```
+
+---
+
+## Bulk-load strategy
+
+1. `ALTER TABLE SET UNLOGGED` — skips WAL during load (3–5× speedup)
+2. Parallel workers each hold one connection with a temp staging table
+3. `COPY` CSV → staging table → `INSERT … ON CONFLICT DO NOTHING` → hypertable
+4. After all workers: `SET LOGGED` → rebuild index → compress all chunks → `VACUUM ANALYZE`
