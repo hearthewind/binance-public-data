@@ -1,3 +1,9 @@
+# Update by Winston
+
+Refactored download code, added retry and overtime mechanisms, now long download sessions can finish without interruption.
+
+ETL from raw csv files to PostgreSQL database, optimized for efficient time series queries.
+
 # Binance Public Data
 
 The website [Binance Data Collection](https://data.binance.vision/) offers easy access for anyone to download Binance's public market data, which is aggregated into `daily` or `monthly` files.
