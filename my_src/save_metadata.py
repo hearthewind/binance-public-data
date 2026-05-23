@@ -1,55 +1,98 @@
+import sys
 import urllib.request
 import json
 
+from psycopg2 import sql
+
 from my_src.sql_connection import create_connection, ensure_database_ready
 
-spot_url = "https://api.binance.com/api/v3/exchangeInfo"
-cm_url = "https://dapi.binance.com/dapi/v1/exchangeInfo"
-um_url = "https://fapi.binance.com/fapi/v1/exchangeInfo"
 
-def symbol2pair(response):
-    ret = []
-    for item in response['symbols']:
-        symbol = item['symbol']
-        base = item['baseAsset']
-        quote = item['quoteAsset']
-        ret.append((symbol, base, quote))
+# ── Market type registry ───────────────────────────────────────────────────────
 
-    ret = sorted(ret, key=lambda x: x[0])
-    return ret
+MARKET_CONFIGS: dict[str, dict] = {
+    'spot': {
+        'url': 'https://api.binance.com/api/v3/exchangeInfo',
+        'table': 'spot_symbols',
+    },
+    'futures_um': {
+        'url': 'https://fapi.binance.com/fapi/v1/exchangeInfo',
+        'table': 'futures_um_symbols',
+    },
+    'futures_cm': {
+        'url': 'https://dapi.binance.com/dapi/v1/exchangeInfo',
+        'table': 'futures_cm_symbols',
+    },
+}
 
-def save_metadata():
-    response = urllib.request.urlopen(spot_url).read()
-    response = json.loads(response)
-    symbol2pair_list = symbol2pair(response)
+
+def symbol2pair(response: dict) -> list[tuple[str, str, str]]:
+    ret = [
+        (item['symbol'], item['baseAsset'], item['quoteAsset'])
+        for item in response['symbols']
+    ]
+    return sorted(ret, key=lambda x: x[0])
+
+
+def save_metadata(market_type: str = 'spot') -> None:
+    """Fetch exchange info for `market_type` and upsert into the metadata table.
+
+    Supported market types: 'spot', 'futures_um', 'futures_cm'.
+    """
+    if market_type not in MARKET_CONFIGS:
+        raise ValueError(
+            f"Unknown market_type {market_type!r}. "
+            f"Choose from: {list(MARKET_CONFIGS)}"
+        )
+
+    config = MARKET_CONFIGS[market_type]
+    table_name = config['table']
+
+    response = urllib.request.urlopen(config['url']).read()
+    symbol2pair_list = symbol2pair(json.loads(response))
 
     ensure_database_ready("binance_metadata", install_timescaledb=False)
-    sql_connection = create_connection("binance_metadata")
-    cur = sql_connection.cursor()
+    conn = create_connection("binance_metadata")
+    try:
+        cur = conn.cursor()
 
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS spot_symbols (
-          symbol TEXT PRIMARY KEY,
-          base_asset TEXT NOT NULL,
-          quote_asset TEXT NOT NULL
-        );
-        """
-    )
+        cur.execute(
+            sql.SQL(
+                """
+                CREATE TABLE IF NOT EXISTS {table} (
+                  symbol      TEXT PRIMARY KEY,
+                  base_asset  TEXT NOT NULL,
+                  quote_asset TEXT NOT NULL
+                );
+                """
+            ).format(table=sql.Identifier(table_name))
+        )
 
-    cur.executemany(
-        """
-        INSERT INTO spot_symbols(symbol, base_asset, quote_asset)
-        VALUES (%s, %s, %s)
-        ON CONFLICT (symbol) DO UPDATE
-        SET base_asset = EXCLUDED.base_asset,
-            quote_asset = EXCLUDED.quote_asset;
-        """,
-        symbol2pair_list,
-    )
-    sql_connection.commit()
-    cur.close()
-    sql_connection.close()
+        cur.executemany(
+            sql.SQL(
+                """
+                INSERT INTO {table}(symbol, base_asset, quote_asset)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (symbol) DO UPDATE
+                  SET base_asset  = EXCLUDED.base_asset,
+                      quote_asset = EXCLUDED.quote_asset;
+                """
+            ).format(table=sql.Identifier(table_name)).as_string(conn),
+            symbol2pair_list,
+        )
+
+        conn.commit()
+        print(f"Saved {len(symbol2pair_list)} symbols to {table_name}.")
+    finally:
+        conn.close()
+
 
 if __name__ == "__main__":
-    save_metadata()
+    _market_type = sys.argv[1] if len(sys.argv) > 1 else 'spot'
+    if _market_type not in MARKET_CONFIGS:
+        print(
+            f"Unknown market_type {_market_type!r}. "
+            f"Choose from: {list(MARKET_CONFIGS)}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    save_metadata(_market_type)

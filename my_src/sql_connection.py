@@ -4,13 +4,19 @@ from contextlib import contextmanager
 import psycopg2
 from psycopg2 import sql
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 
 PG_HOST = os.environ.get('PGHOST', 'localhost')
 PG_SUPERUSER = os.environ.get('PGSUPERUSER', 'postgres')
-PG_SUPERUESR_PASSWORD = 'Postgres@123456'
+PG_SUPERUSER_PASSWORD = os.environ.get('PG_SUPERUSER_PASSWORD', 'Postgres@123456')
 PG_SUPERUSER_DB = os.environ.get('PGSUPERDB', 'postgres')
-APP_DB_USER = 'local_write'
-APP_DB_PASSWORD = 'Abc@123456'
+APP_DB_USER = os.environ.get('APP_DB_USER', 'local_write')
+APP_DB_PASSWORD = os.environ.get('APP_DB_PASSWORD', 'Abc@123456')
 
 
 def _connect(dbname: str, user: str, password: str | None = None, autocommit: bool = True):
@@ -42,7 +48,7 @@ def create_connection(dbname: str):
 
 @contextmanager
 def admin_cursor(dbname: str = PG_SUPERUSER_DB):
-    conn = _connect(dbname, PG_SUPERUSER, PG_SUPERUESR_PASSWORD)
+    conn = _connect(dbname, PG_SUPERUSER, PG_SUPERUSER_PASSWORD)
     try:
         cur = conn.cursor()
         yield cur
@@ -74,7 +80,7 @@ def ensure_database_exists(dbname: str):
         exists = cur.fetchone() is not None
         if not exists:
             cur.execute(
-                sql.SQL("CREATE DATABASE {} OWNER {} TEMPLATE template1;" ).format(
+                sql.SQL("CREATE DATABASE {} OWNER {} TEMPLATE template1;").format(
                     sql.Identifier(dbname), sql.Identifier(APP_DB_USER)
                 )
             )
@@ -97,7 +103,7 @@ def ensure_database_ready(dbname: str, install_timescaledb: bool = True):
                     ) from exc
     with admin_cursor() as cur:
         cur.execute(
-            sql.SQL("GRANT ALL PRIVILEGES ON DATABASE {} TO {};" ).format(
+            sql.SQL("GRANT ALL PRIVILEGES ON DATABASE {} TO {};").format(
                 sql.Identifier(dbname), sql.Identifier(APP_DB_USER)
             )
         )

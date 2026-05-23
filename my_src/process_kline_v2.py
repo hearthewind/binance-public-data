@@ -388,7 +388,7 @@ def process_monthly(
     if skip_checksum:
         print('KLINE_SKIP_CHECKSUM=1 -> skipping checksum verification.')
 
-    table_name = f"klines_{freq}"
+    table_name = f"{market_type}_klines_{freq}"
 
     # -- Table setup --------------------------------------------------------
     conn = create_connection(DB_NAME)
