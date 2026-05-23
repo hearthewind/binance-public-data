@@ -69,6 +69,11 @@ def discover_monthly_work(
     token_file_counts: dict[str, int] = defaultdict(int)
     total_files = 0
 
+    if not os.path.isdir(tokens_dir):
+        raise FileNotFoundError(
+            f"tokens directory not found: {tokens_dir!r}\n"
+            "Check that DATA_ROOT and MARKET_TYPE are correct."
+        )
     tokens = sorted(os.listdir(tokens_dir))
     for token in tokens:
         if freq is not None:
