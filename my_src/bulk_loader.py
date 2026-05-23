@@ -96,13 +96,18 @@ def discover_monthly_work(
 def prepare_bulk_load(table_name: str, index_name: str) -> None:
     conn = create_connection(DB_NAME)
     try:
-        with conn.cursor() as cur:
-            cur.execute(
-                sql.SQL("ALTER TABLE {t} SET UNLOGGED;").format(t=sql.Identifier(table_name))
-            )
-            cur.execute(
-                sql.SQL("DROP INDEX IF EXISTS {idx};").format(idx=sql.Identifier(index_name))
-            )
+        with tqdm(total=2, desc=f"Preparing {table_name}", unit="step", leave=True) as pbar:
+            with conn.cursor() as cur:
+                pbar.set_postfix_str("SET UNLOGGED")
+                cur.execute(
+                    sql.SQL("ALTER TABLE {t} SET UNLOGGED;").format(t=sql.Identifier(table_name))
+                )
+                pbar.update(1)
+                pbar.set_postfix_str("DROP INDEX")
+                cur.execute(
+                    sql.SQL("DROP INDEX IF EXISTS {idx};").format(idx=sql.Identifier(index_name))
+                )
+                pbar.update(1)
         conn.commit()
     finally:
         conn.close()
@@ -113,39 +118,46 @@ def finalize_bulk_load(table_name: str, index_name: str, index_columns: str) -> 
     conn = create_connection(DB_NAME)
     try:
         conn.autocommit = True
-        with conn.cursor() as cur:
-            print(f"  SET LOGGED on {table_name}...")
-            cur.execute(
-                sql.SQL("ALTER TABLE {t} SET LOGGED;").format(t=sql.Identifier(table_name))
-            )
-
-        with conn.cursor() as cur:
-            print(f"  Rebuilding index on {table_name}...")
-            cur.execute(
-                sql.SQL("CREATE INDEX IF NOT EXISTS {idx} ON {t} ({cols});").format(
-                    idx=sql.Identifier(index_name),
-                    t=sql.Identifier(table_name),
-                    cols=sql.SQL(index_columns),
+        with tqdm(total=5, desc=f"Finalising {table_name}", unit="step", leave=True) as pbar:
+            with conn.cursor() as cur:
+                pbar.set_postfix_str("SET LOGGED")
+                cur.execute(
+                    sql.SQL("ALTER TABLE {t} SET LOGGED;").format(t=sql.Identifier(table_name))
                 )
-            )
+            pbar.update(1)
 
-        with conn.cursor() as cur:
-            print(f"  Compressing all chunks of {table_name}...")
-            cur.execute(
-                "SELECT compress_chunk(c, if_not_compressed => TRUE) FROM show_chunks(%s) AS c;",
-                (table_name,),
-            )
+            with conn.cursor() as cur:
+                pbar.set_postfix_str("rebuild index")
+                cur.execute(
+                    sql.SQL("CREATE INDEX IF NOT EXISTS {idx} ON {t} ({cols});").format(
+                        idx=sql.Identifier(index_name),
+                        t=sql.Identifier(table_name),
+                        cols=sql.SQL(index_columns),
+                    )
+                )
+            pbar.update(1)
 
-        with conn.cursor() as cur:
-            cur.execute(
-                sql.SQL(
-                    "ALTER TABLE {t} SET (autovacuum_enabled = true, toast.autovacuum_enabled = true);"
-                ).format(t=sql.Identifier(table_name))
-            )
+            with conn.cursor() as cur:
+                pbar.set_postfix_str("compress chunks")
+                cur.execute(
+                    "SELECT compress_chunk(c, if_not_compressed => TRUE) FROM show_chunks(%s) AS c;",
+                    (table_name,),
+                )
+            pbar.update(1)
 
-        with conn.cursor() as cur:
-            print(f"  VACUUM ANALYZE {table_name}...")
-            cur.execute(sql.SQL("VACUUM ANALYZE {t};").format(t=sql.Identifier(table_name)))
+            with conn.cursor() as cur:
+                pbar.set_postfix_str("autovacuum on")
+                cur.execute(
+                    sql.SQL(
+                        "ALTER TABLE {t} SET (autovacuum_enabled = true, toast.autovacuum_enabled = true);"
+                    ).format(t=sql.Identifier(table_name))
+                )
+            pbar.update(1)
+
+            with conn.cursor() as cur:
+                pbar.set_postfix_str("VACUUM ANALYZE")
+                cur.execute(sql.SQL("VACUUM ANALYZE {t};").format(t=sql.Identifier(table_name)))
+            pbar.update(1)
     finally:
         conn.close()
 

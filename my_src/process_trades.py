@@ -23,66 +23,63 @@ def ensure_tables(conn, chunk_days: int = 30, compress_after_days: int = 90):
     cur = conn.cursor()
     cur.execute("CREATE EXTENSION IF NOT EXISTS timescaledb;")
     cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS trades (
-          time           BIGINT  NOT NULL,
-          symbol         TEXT    NOT NULL,
-          trade_id       BIGINT  NOT NULL,
-          price          DOUBLE PRECISION NOT NULL,
-          qty            DOUBLE PRECISION NOT NULL,
-          quote_qty      DOUBLE PRECISION NOT NULL,
-          is_buyer_maker BOOLEAN NOT NULL,
-          is_best_match  BOOLEAN NOT NULL,
-          PRIMARY KEY (time, symbol, trade_id)
-        );
-        """
+        sql.SQL(
+            """
+            CREATE TABLE IF NOT EXISTS {t} (
+              time           BIGINT  NOT NULL,
+              symbol         TEXT    NOT NULL,
+              trade_id       BIGINT  NOT NULL,
+              price          DOUBLE PRECISION NOT NULL,
+              qty            DOUBLE PRECISION NOT NULL,
+              quote_qty      DOUBLE PRECISION NOT NULL,
+              is_buyer_maker BOOLEAN NOT NULL,
+              is_best_match  BOOLEAN NOT NULL,
+              PRIMARY KEY (time, symbol, trade_id)
+            );
+            """
+        ).format(t=sql.Identifier(TABLE_NAME))
     )
 
     # time is stored in microseconds; chunk interval in same unit
     chunk_interval_us = chunk_days * 24 * 60 * 60 * 1_000_000
     cur.execute(
-        """
-        SELECT create_hypertable('trades'::regclass, 'time',
-            chunk_time_interval => %s, if_not_exists => TRUE);
-        """,
-        (chunk_interval_us,),
+        "SELECT create_hypertable(%s::regclass, 'time', chunk_time_interval => %s, if_not_exists => TRUE);",
+        (TABLE_NAME, chunk_interval_us),
     )
 
     cur.execute(
-        f"CREATE INDEX IF NOT EXISTS {INDEX_NAME} ON trades (symbol, time);"
+        sql.SQL("CREATE INDEX IF NOT EXISTS {idx} ON {t} (symbol, time);").format(
+            idx=sql.Identifier(INDEX_NAME),
+            t=sql.Identifier(TABLE_NAME),
+        )
     )
 
     cur.execute(
-        """
-        ALTER TABLE trades SET (
-          timescaledb.compress = true,
-          timescaledb.compress_segmentby = 'symbol',
-          timescaledb.compress_orderby = 'time ASC'
-        );
-        """
+        sql.SQL(
+            "ALTER TABLE {t} SET ("
+            "  timescaledb.compress = true,"
+            "  timescaledb.compress_segmentby = 'symbol',"
+            "  timescaledb.compress_orderby = 'time ASC'"
+            ");"
+        ).format(t=sql.Identifier(TABLE_NAME))
     )
 
     compress_after_us = compress_after_days * 24 * 60 * 60 * 1_000_000
     cur.execute(
-        """
-        SELECT job_id FROM timescaledb_information.jobs
-        WHERE hypertable_name = 'trades' AND application_name = 'Compression Policy';
-        """
+        "SELECT job_id FROM timescaledb_information.jobs WHERE hypertable_name = %s AND application_name = 'Compression Policy';",
+        (TABLE_NAME,),
     )
     if not cur.fetchone():
         cur.execute(
-            "SELECT add_compression_policy('trades', %s, if_not_exists => TRUE);",
-            (compress_after_us,),
+            "SELECT add_compression_policy(%s, %s, if_not_exists => TRUE);",
+            (TABLE_NAME, compress_after_us),
         )
 
     # Disable autovacuum during bulk load — re-enabled in finalize_bulk_load
     cur.execute(
-        """
-        ALTER TABLE trades SET (
-          autovacuum_enabled = false,
-          toast.autovacuum_enabled = false
-        );
-        """
+        sql.SQL(
+            "ALTER TABLE {t} SET (autovacuum_enabled = false, toast.autovacuum_enabled = false);"
+        ).format(t=sql.Identifier(TABLE_NAME))
     )
     conn.commit()
     cur.close()
@@ -126,25 +123,30 @@ def copy_csv_and_flush(csv_stream, token: str, conn):
             csv_stream,
         )
         cur.execute(
-            """
-            INSERT INTO trades (time, symbol, trade_id, price, qty, quote_qty, is_buyer_maker, is_best_match)
-            SELECT
-              CASE
-                WHEN length(time_text) = 13 THEN time_text::BIGINT * 1000
-                WHEN length(time_text) = 16 THEN time_text::BIGINT
-                ELSE NULL
-              END,
-              %s,
-              trade_id_text::BIGINT,
-              price,
-              qty,
-              quote_qty,
-              is_buyer_maker::BOOLEAN,
-              is_best_match::BOOLEAN
-            FROM tmp_trade_raw
-            WHERE trade_id_text IS NOT NULL AND time_text IS NOT NULL
-            ON CONFLICT (time, symbol, trade_id) DO NOTHING;
-            """,
+            sql.SQL(
+                """
+                INSERT INTO {t} (time, symbol, trade_id, price, qty, quote_qty, is_buyer_maker, is_best_match)
+                SELECT
+                  CASE
+                    WHEN length(time_text) = 13 THEN time_text::BIGINT * 1000
+                    WHEN length(time_text) = 16 THEN time_text::BIGINT
+                    ELSE NULL
+                  END,
+                  %s,
+                  trade_id_text::BIGINT,
+                  price,
+                  qty,
+                  quote_qty,
+                  is_buyer_maker::BOOLEAN,
+                  is_best_match::BOOLEAN
+                FROM {raw_table}
+                WHERE trade_id_text IS NOT NULL AND time_text IS NOT NULL
+                ON CONFLICT (time, symbol, trade_id) DO NOTHING;
+                """
+            ).format(
+                t=sql.Identifier(TABLE_NAME),
+                raw_table=sql.Identifier(TMP_RAW_TABLE),
+            ),
             (token,),
         )
         cur.execute(
